@@ -250,11 +250,12 @@ CMD ["node", "/app/dist-server/cloud-home-start.js"]
 # The self-hosted server, last so a plain `docker build .` builds it.
 FROM runtime AS server
 # The bot box (server/bot-box): bubblewrap runs each bot turn in its own namespaces, socat bridges a box's loopback
-# ports to the server's gates. deploy/box/compose.box.yaml turns it on under the host profiles it needs.
+# ports to the server's gates, and python3 runs the self-check's keyring probe (and bots' scripts).
+# deploy/box/compose.box.yaml turns it on under the host profiles it needs.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bubblewrap socat \
+  && apt-get install -y --no-install-recommends bubblewrap socat python3 \
   && rm -rf /var/lib/apt/lists/* \
-  && bwrap --version && socat -V | head -1
+  && bwrap --version && socat -V | head -1 && python3 --version
 # Optional engine CLIs baked into the image (space-separated npm packages).
 ARG ENGINES=""
 RUN if [ -n "$ENGINES" ]; then HOME=/tmp/omb-build-home npm install -g $ENGINES && rm -rf /tmp/omb-build-home /tmp/node-compile-cache; fi

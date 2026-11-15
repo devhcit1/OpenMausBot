@@ -116,9 +116,9 @@ sudo docker compose exec omb node dist-server/bot-box/box-check.js --public=none
 # expect: "id":"config-hidden","ok":true
 ```
 
-If the log says `bot box: off (userns-refused)`, the sandbox did not start:
-re-run A3, then `sudo docker compose up -d --force-recreate`. A failed
-`keyring-denied` check on its own is a warning, not a problem.
+The self-check line should show every check passing (`33/33`). If the log says
+`bot box: off (userns-refused)`, the sandbox did not start: re-run A3, then
+`sudo docker compose up -d --force-recreate`.
 
 ### A7. Allow only pfSense to reach port 8080
 
@@ -311,5 +311,6 @@ Data lives in `/home/maus/.openmausbot`. Stop the service before backing it up.
 | Chat stops updating after a minute | HAProxy timeouts too short, or buffering the event stream |
 | `bot box: off (userns-refused)` | Host not prepared (A3), or the container started without `compose.box.yaml` (check `COMPOSE_FILE` in `.env`) |
 | `bot box: off (no-bwrap)` | The image was not built from the `self-hosted-bot-box` branch (A2) |
+| Self-check fails only `keyring-denied` | The image predates python3 in the server image: update (A11) |
 
 Logs: `sudo docker compose logs omb` (A) or `journalctl -u openmausbot` (B).
