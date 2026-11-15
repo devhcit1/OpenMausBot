@@ -1,0 +1,315 @@
+# Installing OpenMausBot on a server behind pfSense + HAProxy
+
+This guide installs OpenMausBot on an Ubuntu server where **pfSense/HAProxy
+terminates HTTPS**, so the server itself only speaks plain HTTP on the LAN.
+
+Two ways to run it:
+
+| | A. Docker (recommended) | B. Local service (systemd) |
+|---|---|---|
+| Bot sandbox | **Yes**: bots can't read the server's keys, settings or each other's files | No: bots run as the service user and can read everything it can |
+| Version | The `self-hosted-bot-box` branch, built on the server | The published npm release |
+| Engines (Claude Code, Codex, Grok) | Baked into the image | Installed by you on the host |
+| Updates | `git pull` + rebuild | `npm install` of the new version |
+
+Pick **A** unless you have a reason not to run Docker. The rest of this guide
+uses these placeholders; replace them everywhere:
+
+| Placeholder | Meaning | Example |
+|---|---|---|
+| `SERVER_LAN_IP` | This server's LAN address | `192.168.10.20` |
+| `PFSENSE_IP` | pfSense's address **as this server sees it** (the interface HAProxy connects from) | `192.168.10.1` |
+| `maus02.hcitprofessionals.us` | The public name HAProxy serves | |
+
+---
+
+## A. Docker, with the bot sandbox
+
+### A1. Requirements
+
+- Ubuntu 22.04, 24.04 or newer, x86-64, 2+ CPUs, 4+ GB RAM, 20+ GB free disk.
+- Docker 24+ with the Compose plugin (`docker compose version`). Standard Docker,
+  not rootless.
+- AppArmor on (Ubuntu's default): `cat /sys/module/apparmor/parameters/enabled`
+  prints `Y`.
+- `git`.
+
+If you ran the one-command installer earlier, remove what it left behind (your
+data is kept in `/opt/openmausbot/data`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/milind-soni/OpenMausBot/main/deploy/install.sh | sudo sh -s -- --uninstall
+```
+
+### A2. Get the code and build the server image
+
+```sh
+sudo git clone -b self-hosted-bot-box https://github.com/devhcit1/OpenMausBot.git /opt/openmausbot-src
+cd /opt/openmausbot-src
+sudo docker build -t openmausbot-server:box .
+```
+
+The build takes 10 to 15 minutes. It must end without errors.
+
+### A3. Prepare the host for the sandbox
+
+Installs a seccomp profile in `/etc/mausbot` and loads an AppArmor profile.
+It checks everything first and changes nothing if a check fails.
+
+```sh
+sudo MAUSBOT_PROFILES_DIR=connector/profiles sh deploy/box/prepare-host.sh
+```
+
+It must print `This server is ready for the bots' sandbox.`
+
+### A4. Settings
+
+Create `/opt/openmausbot-src/.env`:
+
+```ini
+# The bot sandbox, layered over the base Compose file
+COMPOSE_FILE=compose.yaml:deploy/box/compose.box.yaml
+# The image built in A2
+OMB_BASE_IMAGE=openmausbot-server:box
+
+# Plain HTTP on the LAN, for HAProxy only
+OMB_BIND_ADDRESS=SERVER_LAN_IP
+OMB_HTTP_PORT=8080
+
+# The public HTTPS name, and who may claim it
+OMB_PUBLIC_URL=https://maus02.hcitprofessionals.us
+OMB_HTTPS_HOST=maus02.hcitprofessionals.us
+OMB_TRUSTED_PROXY_CIDRS=PFSENSE_IP/32
+
+# Engine CLIs baked into the image
+ENGINES="@anthropic-ai/claude-code @openai/codex"
+```
+
+```sh
+sudo chmod 600 /opt/openmausbot-src/.env
+```
+
+`OMB_TRUSTED_PROXY_CIDRS` must be pfSense's address exactly as this server sees
+it. Only requests from there are treated as HTTPS. If it is wrong, the site
+loads but sign-in and pairing behave as if on plain HTTP.
+
+### A5. Start
+
+```sh
+cd /opt/openmausbot-src
+sudo docker compose up -d --build
+```
+
+### A6. Check the sandbox is on
+
+```sh
+cd /opt/openmausbot-src
+sudo docker compose logs omb | grep "bot box"
+# expect: bot box: on (bubblewrap, socat bridges, credential broker, seccomp on)
+#         bot box: self-check NN/NN ...
+
+sudo docker inspect -f '{{.AppArmorProfile}}' "$(sudo docker compose ps -q omb)"
+# expect: omb-home-narrow
+
+sudo docker compose exec omb node dist-server/bot-box/box-check.js --public=none \
+  | grep -o '"id":"config-hidden","ok":[a-z]*'
+# expect: "id":"config-hidden","ok":true
+```
+
+If the log says `bot box: off (userns-refused)`, the sandbox did not start:
+re-run A3, then `sudo docker compose up -d --force-recreate`. A failed
+`keyring-denied` check on its own is a warning, not a problem.
+
+### A7. Allow only pfSense to reach port 8080
+
+```sh
+sudo ufw allow from PFSENSE_IP to any port 8080 proto tcp
+sudo ufw deny 8080/tcp
+```
+
+### A8. HAProxy on pfSense
+
+Backend:
+
+- Server: `SERVER_LAN_IP:8080`, plain HTTP, **HTTP mode** (not TCP).
+- Pass the client's `Host` header through **unchanged**. Never rewrite it to an
+  IP or to `127.0.0.1`.
+- Enable **forwardfor** (`X-Forwarded-For`) and set `X-Forwarded-Proto: https`.
+- Long timeouts, for the live event stream and WebSockets: `timeout tunnel 1h`,
+  and `timeout server` of at least a few minutes.
+- No response buffering or compression of `text/event-stream`.
+- Raise the request body limit if you will upload large files.
+
+Frontend: your HTTPS frontend for `maus02.hcitprofessionals.us`, with your
+certificate, using that backend.
+
+Test from outside: `https://maus02.hcitprofessionals.us/api/health` returns
+`{"app":"openmausbot"}`.
+
+### A9. Sign in as the first admin
+
+```sh
+cd /opt/openmausbot-src
+sudo docker compose exec omb openmausbot pair --label "First admin"
+```
+
+It prints a link starting `https://maus02.hcitprofessionals.us/pair#code=…`,
+valid once for 10 minutes. Open it in a browser, scan its QR code with your
+phone, or paste it into the desktop app under **＋ → Connect to a server**.
+Treat it like a password. Run the command again for each extra device.
+
+If the link starts with `http://` instead, `OMB_PUBLIC_URL` was not picked up:
+check A4 and run `sudo docker compose up -d`.
+
+### A10. Sign in the AI engines
+
+From the app: **Settings → AI**. Codex and Grok can also sign in from the
+server's shell with a device code:
+
+```sh
+sudo docker compose exec omb codex login --device-auth
+```
+
+Their logins are stored in the data volume and survive restarts and updates.
+
+### A11. Day to day
+
+```sh
+cd /opt/openmausbot-src
+sudo docker compose ps                 # status
+sudo docker compose logs -f omb        # logs
+sudo docker compose restart omb        # restart
+sudo docker compose stop               # stop
+```
+
+**Update:**
+
+```sh
+cd /opt/openmausbot-src
+sudo git pull
+sudo docker build -t openmausbot-server:box .
+sudo MAUSBOT_PROFILES_DIR=connector/profiles sh deploy/box/prepare-host.sh
+sudo docker compose up -d --build
+```
+
+Then repeat A6.
+
+**Back up** the data volume (bots, chats, engine logins, paired devices). Stop
+the server first so the database is consistent:
+
+```sh
+cd /opt/openmausbot-src
+sudo docker compose stop omb
+sudo docker run --rm -v openmausbot_data:/data -v "$PWD":/backup debian:bookworm-slim \
+  tar czf /backup/openmausbot-data-$(date +%F).tgz -C /data .
+sudo docker compose start omb
+```
+
+**Never run** `docker compose down -v`: it deletes the data volume.
+
+### Known limitation
+
+With the sandbox on, the **Local VM** computer-use option does not work (the
+sandbox cannot be given Docker access safely). Use **This computer** or a cloud
+computer instead.
+
+---
+
+## B. Local service (systemd), no sandbox
+
+Fewer moving parts, but **no bot sandbox**: anything a bot runs can read the
+service user's files, including the server's settings and keys. Use it only if
+you alone sign in.
+
+### B1. Node 24 and a service user
+
+As an administrator:
+
+```sh
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+sudo useradd --create-home --shell /bin/bash maus
+```
+
+### B2. Install OpenMausBot and the engines as `maus`
+
+```sh
+sudo -iu maus
+npm install --global --prefix "$HOME/.local" openmausbot@0.1.160
+npm install --global --prefix "$HOME/.local" @anthropic-ai/claude-code @openai/codex
+export PATH="$HOME/.local/bin:$PATH"
+openmausbot --version
+```
+
+Sign the engines in now, still as `maus` (`claude`, then `codex login --device-auth`).
+
+Optional, for the bots' browser:
+
+```sh
+exit                                                  # back to the admin shell
+sudo -H npx --yes openmausbot browser install --with-deps
+sudo -iu maus npx --yes openmausbot browser install
+```
+
+### B3. Install the service
+
+As `maus`:
+
+```sh
+openmausbot service install --public-url https://maus02.hcitprofessionals.us --lan
+```
+
+It writes the systemd unit and prints the commands that enable it. Run those
+as an administrator, usually:
+
+```sh
+sudo systemctl daemon-reload && sudo systemctl enable --now openmausbot
+journalctl -u openmausbot -f
+```
+
+`--lan` makes the server listen on this machine's private addresses so
+HAProxy can reach it, on port **8799**. It answers only connections between
+private addresses.
+
+### B4. Firewall and HAProxy
+
+```sh
+sudo ufw allow from PFSENSE_IP to any port 8799 proto tcp
+sudo ufw deny 8799/tcp
+```
+
+HAProxy: as in A8, with the backend at `SERVER_LAN_IP:8799`.
+
+### B5. Pair
+
+As `maus`:
+
+```sh
+openmausbot pair --label "First admin"
+```
+
+### B6. Update
+
+As `maus`, then restart as an administrator:
+
+```sh
+npm install --global --prefix "$HOME/.local" openmausbot@NEW_VERSION
+sudo systemctl restart openmausbot
+```
+
+Data lives in `/home/maus/.openmausbot`. Stop the service before backing it up.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `https://…/api/health` times out | HAProxy backend address or port, or the `ufw` rule |
+| Page loads, pairing link is `http://` | `OMB_PUBLIC_URL` not set (A4) or not passed (B3) |
+| Page loads, sign-in fails or loops | `OMB_TRUSTED_PROXY_CIDRS` is not pfSense's address as seen by the server; or HAProxy rewrites `Host` |
+| Chat stops updating after a minute | HAProxy timeouts too short, or buffering the event stream |
+| `bot box: off (userns-refused)` | Host not prepared (A3), or the container started without `compose.box.yaml` (check `COMPOSE_FILE` in `.env`) |
+| `bot box: off (no-bwrap)` | The image was not built from the `self-hosted-bot-box` branch (A2) |
+
+Logs: `sudo docker compose logs omb` (A) or `journalctl -u openmausbot` (B).
