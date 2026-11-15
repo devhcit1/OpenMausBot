@@ -236,6 +236,12 @@ CMD ["node", "/app/dist-server/cloud-home-start.js"]
 
 # The self-hosted server, last so a plain `docker build .` builds it.
 FROM runtime AS server
+# The bot box (server/bot-box): bubblewrap runs each bot turn in its own namespaces, socat bridges a box's loopback
+# ports to the server's gates. deploy/box/compose.box.yaml turns it on under the host profiles it needs.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends bubblewrap socat \
+  && rm -rf /var/lib/apt/lists/* \
+  && bwrap --version && socat -V | head -1
 # Optional engine CLIs baked into the image (space-separated npm packages).
 ARG ENGINES=""
 RUN if [ -n "$ENGINES" ]; then HOME=/tmp/omb-build-home npm install -g $ENGINES && rm -rf /tmp/omb-build-home /tmp/node-compile-cache; fi
@@ -245,8 +251,10 @@ COPY --from=build --chown=maus:maus /src/dist ./dist
 COPY --from=build --chown=maus:maus /src/skills ./skills
 # `docker compose exec omb openmausbot pair`: the commands the CLI prints start the same way.
 RUN printf '#!/bin/sh\nexec node /app/dist-server/openmausbot.js "$@"\n' > /usr/local/bin/openmausbot && chmod 0755 /usr/local/bin/openmausbot
+# OMB_IMAGE=server: deploy/install.sh reads this from the image's settings to know it can run the bots' sandbox.
 ENV HOME=/data \
-    OMB_CLI_PREFIX="docker compose exec omb openmausbot"
+    OMB_CLI_PREFIX="docker compose exec omb openmausbot" \
+    OMB_IMAGE=server
 VOLUME ["/data"]
 USER maus
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
