@@ -3,16 +3,17 @@
 This guide installs OpenMausBot on an Ubuntu server where **pfSense/HAProxy
 terminates HTTPS**, so the server itself only speaks plain HTTP on the LAN.
 
-Two ways to run it:
+Three ways to run it:
 
-| | A. Docker (recommended) | B. Local service (systemd) |
-|---|---|---|
-| Bot sandbox | **Yes**: bots can't read the server's keys, settings or each other's files | No: bots run as the service user and can read everything it can |
-| Version | The `self-hosted-bot-box` branch, built on the server | The published npm release |
-| Engines (Claude Code, Codex, Grok) | Baked into the image | Installed by you on the host |
-| Updates | `git pull` + rebuild | `npm install` of the new version |
+| | A. Docker | B. Local service (systemd) | C. Host service with sandbox and desktops |
+|---|---|---|---|
+| Bot sandbox | **Yes**: bots can't read the server's keys, settings or each other's files | No: bots run as the service user and can read everything it can | **Yes**, as in A |
+| Bot desktops (Local VM) | No | Yes, but unsandboxed | **Yes**, through rootless Podman |
+| Version | The `self-hosted-bot-box` branch, built on the server | The published npm release | The `self-hosted-bot-box` branch, built on the server |
+| Engines (Claude Code, Codex, Grok) | Baked into the image | Installed by you on the host | Installed by the script |
+| Updates | `git pull` + rebuild | `npm install` of the new version | Re-run the script |
 
-Pick **A** unless you have a reason not to run Docker. The rest of this guide
+Pick **C** if bots need a desktop, otherwise **A**. The rest of this guide
 uses these placeholders; replace them everywhere:
 
 | Placeholder | Meaning | Example |
@@ -122,9 +123,11 @@ The self-check line should show every check passing (`33/33`). If the log says
 
 ### A7. Allow only pfSense to reach port 8080
 
+Docker's published ports bypass `ufw`, so the rule goes in Docker's own chain:
+
 ```sh
-sudo ufw allow from PFSENSE_IP to any port 8080 proto tcp
-sudo ufw deny 8080/tcp
+sudo iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctdir ORIGINAL ! -s PFSENSE_IP -j DROP
+sudo apt-get install -y iptables-persistent && sudo netfilter-persistent save
 ```
 
 ### A8. HAProxy on pfSense
@@ -209,9 +212,8 @@ sudo docker compose start omb
 
 ### Known limitation
 
-With the sandbox on, the **Local VM** computer-use option does not work (the
-sandbox cannot be given Docker access safely). Use **This computer** or a cloud
-computer instead.
+Under Docker, bots get no **Local VM** desktop: that would mean handing the
+container Docker's socket, which is root on the host. For desktops, use **C**.
 
 ---
 
@@ -301,6 +303,71 @@ Data lives in `/home/maus/.openmausbot`. Stop the service before backing it up.
 
 ---
 
+## C. Host service with the bot sandbox and desktops
+
+The server runs on the host as the user `maus`, with the bot sandbox on, and
+bots get **Local VM** desktops through rootless Podman. Use it when bots need a
+desktop. One script installs it, or moves an **A** install over, data included.
+
+### C1. Requirements
+
+- Ubuntu 24.04 or newer, with systemd. Plus A1's CPU, RAM and disk, and about
+  4 GB more disk for each desktop.
+- A normal user can run a sandbox. The script checks this and stops if it can't.
+
+### C2. Install, or move from Docker
+
+```sh
+sudo git clone -b self-hosted-bot-box https://github.com/devhcit1/OpenMausBot.git /opt/openmausbot
+sudo bash /opt/openmausbot/deploy/host/install.sh \
+  --public-url https://maus02.hcitprofessionals.us --proxy-ip PFSENSE_IP --import-docker
+```
+
+Leave out `--import-docker` on a server without an **A** install. With it, the
+script:
+
+1. stops the Docker containers and turns off their restart, leaving the
+   containers and the volume as they are;
+2. copies the volume to `/data`, which becomes `maus`'s home, as it was inside
+   the container. Saved paths and engine logins still work.
+
+The script also:
+
+- installs Node 24, Podman, bubblewrap and the engines;
+- builds the branch into `/opt/openmausbot`, owned by root;
+- installs the `openmausbot` service on port **8080**, so HAProxy needs no
+  change;
+- allows only `PFSENSE_IP` through `ufw` to ports 8080 and 8081.
+
+It ends by printing the sandbox's status and self-check. Expect
+`bot box: on (...)` and every check passing.
+
+### C3. Use a desktop
+
+In the app, open the bot's **Screen** panel and set **Works on** to **Local VM**. The first
+start downloads the desktop image (a few GB), so allow a few minutes. Each
+conversation reaches only its own desktop connection.
+
+### C4. Day to day
+
+```sh
+systemctl status openmausbot
+journalctl -u openmausbot -f
+sudo -iu maus openmausbot pair --label "My phone"
+sudo -iu maus codex login --device-auth
+sudo -iu maus podman ps                                    # running desktops
+```
+
+**Update:** run C2's script again without `--import-docker`. It pulls the
+branch, rebuilds and restarts.
+
+**Back up:** `sudo systemctl stop openmausbot`, then archive `/data`.
+
+**Go back to Docker:** the script prints the exact commands at the end. Your
+Docker volume is untouched until you delete it.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -313,4 +380,7 @@ Data lives in `/home/maus/.openmausbot`. Stop the service before backing it up.
 | `bot box: off (no-bwrap)` | The image was not built from the `self-hosted-bot-box` branch (A2) |
 | Self-check fails only `keyring-denied` | The image predates python3 in the server image: update (A11) |
 
-Logs: `sudo docker compose logs omb` (A) or `journalctl -u openmausbot` (B).
+| C: `bubblewrap cannot make a sandbox as maus` | AppArmor refuses user namespaces: `sudo apt-get install --reinstall apparmor bubblewrap`, then `sudo systemctl reload apparmor` |
+| C: Local VM won't start | Run `sudo -iu maus podman info`. A `/run/user/...` error means lingering is off: `sudo loginctl enable-linger maus` |
+
+Logs: `sudo docker compose logs omb` (A) or `journalctl -u openmausbot` (B, C).
