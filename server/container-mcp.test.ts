@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CONTAINER, CUA_EXECUTABLE, CUA_SOCKET } from "./container-computer.ts";
+import { VM_EXEC_TOOL } from "./local-vm-shell.ts";
 import { omittedFromErrorNote } from "./mcp-error-result.ts";
 
 const temporary: string[] = [];
@@ -102,7 +103,7 @@ posixOnly("Local VM Cua MCP bridge", () => {
     const lines = result.stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
     expect(lines).toEqual([
       { jsonrpc: "2.0", id: 2, result: {} },
-      { jsonrpc: "2.0", id: 1, result: { tools: [] } },
+      { jsonrpc: "2.0", id: 1, result: { tools: [VM_EXEC_TOOL] } },
     ]);
     expect(result.stderr).not.toContain("PING-RECEIVED");
     expect(result.stderr).toContain(
