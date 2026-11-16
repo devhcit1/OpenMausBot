@@ -60,6 +60,7 @@ const ENTRY_POINTS = [
   "drivers/chatgpt-plan-token-command.ts",
   // the bot box (server/bot-box): the in-box bridge, the probe the self-check runs inside a box, and the check by hand
   "bot-box/box-bridge.ts",
+  "bot-box/desktop-bridge.ts",
   "bot-box/box-probe.ts",
   "bot-box/box-check.ts",
   // the meeting bot, copied to a cloud computer and run there with its own Node

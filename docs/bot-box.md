@@ -69,7 +69,7 @@ checks it guards.
 
 ## What it does not do yet
 
-- **Local VM (Docker) computer use.** The computer MCP talks to the Local VM over the host's Docker socket. The box does not expose that socket (mounting it would be root-equivalent on the host), so with the bot box on a Local VM turn fails early with a clear message instead of "MCP server exited". Use this computer, a Cloud computer, or turn the box off for Local VM work.
+- **Local VM computer use goes through a relay.** The box never sees the container runtime's socket (under Docker that is root-equivalent on the host). The server runs the Local VM's computer MCP itself, outside the box, and the engine reaches it through a per-conversation unix socket in `<data>/box/` lent only to that conversation's boxes (`server/bot-box/desktop-relay.ts`). The server still needs the runtime: on a self-hosted server that is rootless Podman for the user running MausBot, not Docker inside the MausBot container.
 
 - The engines' subscription logins (`~/.claude`, `~/.codex`) are in the box, because the engine needs them. API keys
   stay in the environment until the credential broker (T0b) replaces them with per-turn tokens.

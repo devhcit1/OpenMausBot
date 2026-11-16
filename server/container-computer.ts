@@ -1098,7 +1098,7 @@ export async function containerExec(
   return { exitCode: result.code, stdout: clipExecOutput(result.stdout), stderr: clipExecOutput(result.stderr), timedOut };
 }
 
-type ContainerMcpLaunch = {
+export type ContainerMcpLaunch = {
   command: string;
   args: string[];
   env: Record<string, string>;

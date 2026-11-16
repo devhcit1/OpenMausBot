@@ -281,6 +281,17 @@ describe("BoxRunner.lend", () => {
     expect(runner.wrap(request).plan.writable).not.toContain(layer);
     expect(runner.lentTo("bot-a", "thread-1")).toEqual([]);
   });
+
+  it("keeps each holder's lent paths: a desktop's socket and a memory layer never take each other back", () => {
+    const runner = new BoxRunner({ bwrap: "/usr/bin/bwrap", bridge, setup: { dataDir: "/data/.openmausbot", home: "/data", codeRoots: [], engineRoots: [], bridges: [] }, denyEnv: new Set() });
+    runner.lend("bot-a", "thread-1", ["/data/.openmausbot/workspaces/layer"]);
+    runner.lend("bot-a", "thread-1", ["/data/.openmausbot/box/desktop-1.sock"], "desktop");
+    expect(runner.lentTo("bot-a", "thread-1")).toEqual(["/data/.openmausbot/workspaces/layer", "/data/.openmausbot/box/desktop-1.sock"]);
+    runner.lend("bot-a", "thread-1", []);
+    expect(runner.lentTo("bot-a", "thread-1")).toEqual(["/data/.openmausbot/box/desktop-1.sock"]);
+    runner.lend("bot-a", "thread-1", [], "desktop");
+    expect(runner.lentTo("bot-a", "thread-1")).toEqual([]);
+  });
 });
 
 describe("the probe tells the server and the canary from a box process with the same pid", () => {
