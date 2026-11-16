@@ -73,11 +73,14 @@ export interface RunnerOptions {
   broker?: { port: number; mintForProcess(input: { botId?: string | null; threadId?: string | null; grants: Record<string, BrokerGrant> }): { token: string }; revoke(token: string): void } | null;
 }
 
+export type LendHolder = "memory" | "desktop";
+
 /** Wraps spawns for one setup (the server's, or a self-check fixture's). */
 export class BoxRunner {
   private readonly options: RunnerOptions;
-  /** Paths a conversation's turns may write besides the bot's own folder (a member's or a room's memory layer on a Team Cloud). */
-  private readonly lent = new Map<string, readonly string[]>();
+  /** Paths a conversation's turns may write besides the bot's own folder, per holder: a Team Cloud's memory layers, a
+   * desktop's relay socket. */
+  private readonly lent = new Map<string, Map<LendHolder, readonly string[]>>();
   private audiences: BoxAudienceScope | null = null;
 
   constructor(options: RunnerOptions) { this.options = options; }
@@ -104,13 +107,16 @@ export class BoxRunner {
 
   get setup(): BoxSetup { return this.options.setup; }
 
-  /** Lends `rw` paths to every box of this conversation until `lend` is called again with none. */
-  lend(botId: string, threadId: string, rw: readonly string[]): void {
-    if (rw.length) this.lent.set(`${botId}/${threadId}`, [...rw]); else this.lent.delete(`${botId}/${threadId}`);
+  /** Lends `rw` paths to every box of this conversation until the same holder lends again with none. */
+  lend(botId: string, threadId: string, rw: readonly string[], holder: LendHolder = "memory"): void {
+    const key = `${botId}/${threadId}`;
+    const holders = this.lent.get(key) ?? new Map<LendHolder, readonly string[]>();
+    if (rw.length) holders.set(holder, [...rw]); else holders.delete(holder);
+    if (holders.size) this.lent.set(key, holders); else this.lent.delete(key);
   }
 
   lentTo(botId: string, threadId: string): readonly string[] {
-    return this.lent.get(`${botId}/${threadId}`) ?? [];
+    return [...new Set([...(this.lent.get(`${botId}/${threadId}`)?.values() ?? [])].flat())];
   }
 
   wrap(given: BoxRequest): WrappedSpawn {
@@ -340,7 +346,7 @@ export class BotBox {
   }
 
   /** More read-write folders for one conversation's boxes (a memory layer); nothing without a runner. */
-  lend(botId: string, threadId: string, rw: readonly string[]): void { this.runner?.lend(botId, threadId, rw); }
+  lend(botId: string, threadId: string, rw: readonly string[], holder: LendHolder = "memory"): void { this.runner?.lend(botId, threadId, rw, holder); }
 
   tools(): { bwrap: string; socat: string | null } | null { return this.detection.tools; }
 

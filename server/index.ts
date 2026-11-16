@@ -8016,8 +8016,9 @@ async function beginTurn(
         }
         try {
           if (lazyReadyVm) {
-            integrations.localComputer = containerComputerMcp(
+            integrations.localComputer = await containerComputerMcp(
               lazyReadyVm.runtime,
+              { botId: bot.id, threadId },
               controlIntegration(bot.id, threadId, dispatchClaimId),
               localVmTarget,
             );
@@ -8045,8 +8046,9 @@ async function beginTurn(
             return true;
           }
           const claimed = await claimAutoLocalVm(threadId);
-          integrations.localComputer = containerComputerMcp(
+          integrations.localComputer = await containerComputerMcp(
             claimed.runtime,
+            { botId: bot.id, threadId },
             controlIntegration(bot.id, threadId, dispatchClaimId),
             claimed.target,
           );
@@ -9954,8 +9956,9 @@ async function runClaimedGroupMemberTurn(
       if (owner?.threadId !== threadId || owner.botId !== readyBot.id) {
         throw new Error("the Local VM lease expired while preparing the turn");
       }
-      integrations.localComputer = containerComputerMcp(
+      integrations.localComputer = await containerComputerMcp(
         vm.runtime,
+        { botId: readyBot.id, threadId },
         controlIntegration(readyBot.id, threadId, internalGeneration, { localVmTarget: target }),
         target,
       );
