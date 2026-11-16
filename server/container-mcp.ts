@@ -1,6 +1,7 @@
-// A stdio bridge into Cua Driver's MCP server in the Local VM. It defines no tools; the shared bridge only answers ping,
-// makes tool schemas provider-safe and keeps error results text-only.
-import { cuaExecArgs } from "./container-computer.ts";
+// A stdio bridge into Cua Driver's MCP server in the Local VM. Besides Cua Driver's tools it adds one, exec, a shell
+// command in the VM; the shared bridge answers ping, makes tool schemas provider-safe and keeps error results text-only.
+import { cuaExecArgs, DISPLAY } from "./container-computer.ts";
+import { runVmExec, VM_EXEC_TOOL, withVmExecTool } from "./local-vm-shell.ts";
 import { runMcpBridge } from "./mcp-bridge.ts";
 
 const [runtime, container, socket] = process.argv.slice(2);
@@ -22,6 +23,8 @@ runMcpBridge({
   args: cuaExecArgs(["mcp", "--socket", socket], { container, interactive: true }),
   label: "Cua Driver",
   consoleChild: true,
+  rewriteResponse: withVmExecTool,
+  relay: (call) => (call.name === VM_EXEC_TOOL.name ? runVmExec(runtime, container, DISPLAY, call.arguments) : null),
   // No liveness watchdog: the runtime CLI talks to a local daemon and fails fast on its own.
   ...(controlUrl && controlToken ? { gate: { url: controlUrl, token: controlToken } } : {}),
 });

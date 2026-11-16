@@ -348,6 +348,11 @@ In the app, open the bot's **Screen** panel and set **Works on** to **Local VM**
 start downloads the desktop image (a few GB), so allow a few minutes. Each
 conversation reaches only its own desktop connection.
 
+The desktop is the bot's own computer, with normal network access: it runs
+commands there with its `exec` tool, `ssh` included. The bot's own shell stays
+in the sandbox, which reaches only the public internet. An SSH key the bot
+should use goes in the desktop (`~/.ssh` of its user, `cua`).
+
 ### C4. Day to day
 
 ```sh

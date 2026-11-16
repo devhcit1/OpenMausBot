@@ -52,7 +52,7 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // localhost/ is explicit: Podman prepends it to unqualified build tags and may then resolve the name on Docker Hub.
 // Image and container labels, not this mutable tag, decide compatibility.
 export const IMAGE_REPOSITORY = "localhost/openmausbot/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "9";
+export const IMAGE_LAYER_VERSION = "10";
 export const IMAGE_LAYER_LABEL = "com.openmausbot.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export const CONTAINER = "openmausbot-computer";
@@ -167,6 +167,13 @@ RUN set -eux; \\
     install -D -m 0755 "$driver_bin" ${CUA_EXECUTABLE}; \\
     install -d -o cua -g cua -m 0700 ${VM_WORKSPACE_GUEST}; \\
     test "$(${CUA_EXECUTABLE} --version)" = "cua-driver ${CUA_DRIVER_VERSION}"
+# The exec tool's ssh: the bot reaches servers from its own desktop.
+RUN set -eux; \\
+    if ! command -v ssh >/dev/null && command -v apt-get >/dev/null; then \\
+      apt-get update; \\
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-client; \\
+      rm -rf /var/lib/apt/lists/*; \\
+    fi
 # Install before XFCE starts so the panel and window manager see the font too.
 # Noto Sans CJK JP is distributed under the SIL Open Font License 1.1.
 RUN set -eux; \\
