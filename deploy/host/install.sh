@@ -64,13 +64,13 @@ case "$PORT" in ''|*[!0-9]*) die "--port must be a number" ;; esac
 if ! command -v systemctl >/dev/null || [ ! -d /run/systemd/system ]; then die "this server does not run systemd"; fi
 command -v apt-get >/dev/null || die "this script is for Ubuntu or Debian (apt)"
 
-as_maus() {
-  local uid
+as_maus() (
   uid="$(id -u "$SERVICE_USER")"
+  cd "$SERVICE_HOME"
   runuser -u "$SERVICE_USER" -- env -i HOME="$SERVICE_HOME" USER="$SERVICE_USER" LOGNAME="$SERVICE_USER" \
     PATH=/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR="/run/user/$uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
-}
+)
 
 say "packages"
 export DEBIAN_FRONTEND=noninteractive
