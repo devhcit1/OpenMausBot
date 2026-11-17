@@ -858,7 +858,25 @@ root service on a Unix socket only that user may open. Your workspace then
 shows **Settings → Installations** (with the enterprise `admin` feature): create
 an installation, add or remove who may sign in, suspend, resume, delete, upgrade
 all, and see each one's spend this month. Every action goes through the
-agent's audit log at `/var/log/openmausbot/fleet.jsonl`.
+agent's audit log at `/var/log/openmausbot/fleet.jsonl`. Add
+`--operator-port PORT` when your own workspace runs on this server too.
+Without a session, it trusts loopback callers as its owner, so the fence
+then closes that port, and the webhook port after it, to everyone but the
+operator's user and root.
+
+**Behind a proxy that ends TLS** (HAProxy, nginx on another machine):
+`--behind-proxy PROXY_IP [--edge-port 8800]`. Caddy then serves every
+workspace as plain HTTP on that one port, as `http://<name>.<domain>:8800`,
+and holds no certificates. It drops any connection that does not come from
+`PROXY_IP`. It sets `X-Forwarded-Proto: https`, and passes the proxy's
+`X-Forwarded-For` through, so sign-in limits apply to each real client.
+Point `*.<domain>` at the proxy, give the proxy the wildcard certificate,
+and send that whole domain to `SERVER:8800`. A later `init --yes` keeps both
+settings, and rewrites every site when you change them.
+
+`fleet upgrade` runs `npm install -g openmausbot@latest` only when the fleet
+runs from an npm install. On a server built from a checkout, it restarts the
+workspaces on what is there now.
 
 `https://acme.example.com` is up when `create` returns; the first admin signs
 in with an emailed code. `OMB_LICENSE_KEY` in the environment (or

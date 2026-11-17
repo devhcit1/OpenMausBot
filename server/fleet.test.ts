@@ -197,7 +197,47 @@ describe("plans", () => {
       expect(() => deletePlan({ registry: incomplete, slug: "acme", keepData: false, layout })).toThrow("operator recovery");
     }
     const two = createPlan({ registry: created.registry, slug: "globex", seed: { admins: ["g@x.test"], members: [] }, now, layout }).registry;
-    expect(argvOf(upgradePlan({ registry: suspendPlan({ registry: two, slug: "globex", layout }).registry }))).toEqual(["npm install -g openmausbot@latest", "systemctl restart openmausbot@acme.service"]);
+    const oneRunning = suspendPlan({ registry: two, slug: "globex", layout }).registry;
+    expect(argvOf(upgradePlan({ registry: oneRunning, script: "/usr/lib/node_modules/openmausbot/dist-server/openmausbot.js" }))).toEqual(["npm install -g openmausbot@latest", "systemctl restart openmausbot@acme.service"]);
+    const checkout = upgradePlan({ registry: oneRunning, script: "/opt/openmausbot/dist-server/openmausbot.js" });
+    expect(argvOf(checkout)).toEqual(["systemctl restart openmausbot@acme.service"]);
+    expect(checkout[0]).toMatchObject({ kind: "note", text: expect.stringContaining("/opt/openmausbot/dist-server/openmausbot.js") });
+  });
+
+  it("serves the workspaces behind a proxy that ends TLS: plain HTTP on one port, to that proxy only", () => {
+    const edge = { proxy: "172.17.0.24", port: 8800 };
+    const { registry, steps } = initPlan({ domain: "ai.example.test", node: "/usr/bin/node", script: "/opt/openmausbot/dist-server/openmausbot.js", operator: "maus", edge, layout });
+    expect(registry.edge).toEqual(edge);
+    expect(parseRegistry(JSON.stringify(registry)).edge).toEqual(edge);
+    expect(steps.at(-2)).toMatchObject({ kind: "note", text: expect.stringContaining("only 172.17.0.24 may connect") });
+    const created = createPlan({ registry, slug: "acme", seed: { admins: ["a@b.test"], members: [] }, now, layout });
+    const site = created.steps.find((step) => step.kind === "write" && step.path.endsWith("acme.caddy"));
+    expect(site).toMatchObject({ content: caddySite(created.workspace, edge) });
+    const running = caddySite(created.workspace, edge);
+    expect(running.split("\n").slice(0, 4)).toEqual(["http://acme.ai.example.test:8800 {", "\t@outside not remote_ip 172.17.0.24", "\troute {", "\t\tabort @outside"]);
+    expect(running).toContain("reverse_proxy /hooks/* 127.0.0.1:8811 {");
+    expect(running).toContain("reverse_proxy 127.0.0.1:8810 {");
+    expect(running.match(/header_up X-Forwarded-Proto https/g)).toHaveLength(2);
+    expect(running.match(/header_up X-Forwarded-For \{http\.request\.header\.X-Forwarded-For\}/g)).toHaveLength(2);
+    const suspended = suspendPlan({ registry: created.registry, slug: "acme", layout }).steps.find((step) => step.kind === "write" && step.path.endsWith("acme.caddy"));
+    expect(suspended).toMatchObject({ content: expect.stringContaining("abort @outside\n\t\trespond \"This workspace is suspended.\" 503") });
+    expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", edge: { proxy: "pfsense.lan", port: 8800 }, layout })).toThrow("not an IP address");
+    expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", edge: { proxy: "10.0.0.1", port: 8810 }, layout })).toThrow("below 8810");
+    expect(() => parseRegistry(JSON.stringify({ ...registry, edge: { proxy: "x", port: 1 } }))).toThrow("not an IP address");
+  });
+
+  it("fences the operator's own workspace to the operator, in every fence a plan writes", () => {
+    const fenceOf = (steps: FleetStep[]) => steps.flatMap((step) => (step.kind === "write" && step.path === layout.fenceFile ? [step.content] : []));
+    const rule = "oif lo tcp dport { 8080, 8081 } meta skuid != { maus, root } reject";
+    const init = initPlan({ domain: "ai.example.test", node: "n", script: "s", operator: "maus", operatorPort: 8080, layout });
+    expect(parseRegistry(JSON.stringify(init.registry)).operatorPort).toBe(8080);
+    const created = createPlan({ registry: init.registry, slug: "acme", seed: { admins: ["a@b.test"], members: [] }, now, layout });
+    const deleted = deletePlan({ registry: created.registry, slug: "acme", keepData: false, layout });
+    for (const fence of [...fenceOf(init.steps), ...fenceOf(created.steps), ...fenceOf(deleted.steps)]) expect(fence).toContain(rule);
+    expect(fenceOf(initPlan({ domain: "ai.example.test", node: "n", script: "s", operator: "maus", layout }).steps)[0]).not.toContain("reject");
+    expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", operatorPort: 8080, layout })).toThrow("needs --operator");
+    expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", operator: "maus", operatorPort: 8809, layout })).toThrow("below 8809");
+    expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", operator: "maus", operatorPort: 8799, edge: { proxy: "10.0.0.1", port: 8800 }, layout })).toThrow("--edge-port must differ");
   });
 
   it("seeds only the trusted portal gateway and reserves the portal hostname", () => {

@@ -1,5 +1,6 @@
 // Many client workspaces on one Linux server, each its own OS user and `openmausbot@<slug>` service. This module only plans:
 // it renders files and fixed argument lists as steps, and never builds a shell command string.
+import { isIP } from "node:net";
 import { posix } from "node:path";
 
 const { join } = posix;
@@ -9,6 +10,7 @@ export const FLEET_SLUG = /^[a-z][a-z0-9-]{1,30}$/;
 export const FLEET_USER_PREFIX = "omb-";
 export const FLEET_FIRST_PORT = 8810;
 export const FLEET_PORT_STRIDE = 10;
+export const FLEET_EDGE_PORT = 8800;
 
 export interface FleetLayout {
   etcDir: string;
@@ -79,13 +81,32 @@ export interface FleetWorkspace {
   accountCreated?: boolean;
 }
 
+/**
+ * A TLS-terminating proxy on another machine (HAProxy, nginx) in front of the fleet. Caddy then serves every workspace
+ * as plain HTTP on `port`, holds no certificates, and answers only connections from `proxy`.
+ */
+export interface FleetEdge {
+  proxy: string;
+  port: number;
+}
+
 export interface FleetRegistry {
   version: 1;
   domain: string;
   nextPort: number;
   /** The Unix user whose workspace may drive the fleet agent. */
   operator?: string;
+  /** The operator workspace's port; it and the webhook port after it are fenced to the operator's user. */
+  operatorPort?: number;
+  /** Absent: Caddy on this server terminates TLS and fetches each workspace's certificate itself. */
+  edge?: FleetEdge;
   workspaces: Record<string, FleetWorkspace>;
+}
+
+export function assertEdge(edge: FleetEdge): void {
+  if (!isIP(edge.proxy)) throw new Error(`"${edge.proxy}" is not an IP address: --behind-proxy takes the proxy's own address`);
+  if (!Number.isInteger(edge.port) || edge.port < 1024 || edge.port > 65_535) throw new Error("--edge-port must be 1024-65535");
+  if (edge.port >= FLEET_FIRST_PORT) throw new Error(`--edge-port must be below ${FLEET_FIRST_PORT}, where workspace ports start`);
 }
 
 export function emptyRegistry(domain: string): FleetRegistry {
@@ -98,11 +119,18 @@ export function parseRegistry(text: string): FleetRegistry {
   if (!record || record.version !== 1 || typeof record.domain !== "string" || typeof record.nextPort !== "number" || !record.workspaces || typeof record.workspaces !== "object") {
     throw new Error("fleet.json is not a fleet registry this version understands");
   }
+  let edge: FleetEdge | undefined;
+  if (record.edge !== undefined) {
+    edge = { proxy: String(record.edge?.proxy), port: Number(record.edge?.port) };
+    assertEdge(edge);
+  }
   return {
     version: 1,
     domain: record.domain,
     nextPort: record.nextPort,
     ...(typeof record.operator === "string" ? { operator: record.operator } : {}),
+    ...(typeof record.operatorPort === "number" ? { operatorPort: record.operatorPort } : {}),
+    ...(edge ? { edge } : {}),
     workspaces: { ...record.workspaces },
   };
 }
@@ -196,9 +224,14 @@ export function fenceUnit(layout = fleetLayout()): string {
   ].join("\n");
 }
 
-/** nftables: only a workspace's own user, Caddy and root may open its loopback ports, so a bot's shell cannot reach a sibling's API. */
-export function fenceRules(workspaces: FleetWorkspace[]): string {
+/**
+ * nftables: only a workspace's own user, Caddy and root may open its loopback ports, so a bot's shell cannot reach a
+ * sibling's API. Security: the operator's workspace trusts its loopback callers as its owner, so its ports are fenced
+ * to the operator's user and root too, or any workspace's bot could act as the operator.
+ */
+export function fenceRules(workspaces: FleetWorkspace[], operator?: { user: string; port: number }): string {
   const lines = ["#!/usr/sbin/nft -f", "# Written by `openmausbot fleet`; regenerated on every create, suspend, resume and delete.", "add table inet openmausbot", "flush table inet openmausbot", "table inet openmausbot {", "\tchain output {", "\t\ttype filter hook output priority 0; policy accept;"];
+  if (operator) lines.push(`\t\toif lo tcp dport { ${operator.port}, ${operator.port + 1} } meta skuid != { ${operator.user}, root } reject`);
   for (const workspace of [...workspaces].sort((a, b) => a.slug.localeCompare(b.slug))) {
     if (workspace.status !== "running" && workspace.status !== "suspended" && workspace.status !== "retained" && !workspace.accountCreated) continue;
     lines.push(`\t\toif lo tcp dport { ${workspace.port}, ${workspace.webhookPort} } meta skuid != { ${fleetUser(workspace.slug)}, caddy, root } reject`);
@@ -207,7 +240,13 @@ export function fenceRules(workspaces: FleetWorkspace[]): string {
   return lines.join("\n");
 }
 
-export function caddySite(workspace: Pick<FleetWorkspace, "host" | "port" | "webhookPort" | "status">): string {
+/** The whole fence for a registry. */
+export function registryFence(registry: FleetRegistry): string {
+  return fenceRules(Object.values(registry.workspaces), registry.operator && registry.operatorPort ? { user: registry.operator, port: registry.operatorPort } : undefined);
+}
+
+export function caddySite(workspace: Pick<FleetWorkspace, "host" | "port" | "webhookPort" | "status">, edge?: FleetEdge): string {
+  if (edge) return edgeSite(workspace, edge);
   if (workspace.status !== "running") {
     const message = workspace.status === "suspended" ? "This workspace is suspended." : "This workspace is not available.";
     return [`${workspace.host} {`, `\trespond "${message}" 503`, "}", ""].join("\n");
@@ -222,6 +261,38 @@ export function caddySite(workspace: Pick<FleetWorkspace, "host" | "port" | "web
     `\t\treverse_proxy 127.0.0.1:${workspace.port} {`,
     "\t\t\tflush_interval -1",
     "\t\t}",
+    "\t}",
+    "}",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Security: the workspace takes the last X-Forwarded-For hop from its loopback peer as the client's address (sign-in
+ * lockouts key on it). Behind an edge that hop is the one the proxy appended, so only the proxy may reach this listener:
+ * any other peer is dropped before a header is read. `route` keeps that check ahead of the proxying, which Caddy would
+ * otherwise order first.
+ */
+function edgeSite(workspace: Pick<FleetWorkspace, "host" | "port" | "webhookPort" | "status">, edge: FleetEdge): string {
+  const forwarded = ["\t\t\theader_up X-Forwarded-For {http.request.header.X-Forwarded-For}", "\t\t\theader_up X-Forwarded-Proto https"];
+  const body = workspace.status === "running"
+    ? [
+        "\t\tencode zstd gzip",
+        `\t\treverse_proxy /hooks/* 127.0.0.1:${workspace.webhookPort} {`,
+        ...forwarded,
+        "\t\t}",
+        `\t\treverse_proxy 127.0.0.1:${workspace.port} {`,
+        "\t\t\tflush_interval -1",
+        ...forwarded,
+        "\t\t}",
+      ]
+    : [`\t\trespond "${workspace.status === "suspended" ? "This workspace is suspended." : "This workspace is not available."}" 503`];
+  return [
+    `http://${workspace.host}:${edge.port} {`,
+    `\t@outside not remote_ip ${edge.proxy}`,
+    "\troute {",
+    "\t\tabort @outside",
+    ...body,
     "\t}",
     "}",
     "",
@@ -294,11 +365,25 @@ export function assertUnixUser(name: string): void {
   if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(name)) throw new Error(`"${name}" is not a Unix user name`);
 }
 
-export function initPlan(input: { domain: string; node: string; script: string; operator?: string; layout?: FleetLayout }): { steps: FleetStep[]; registry: FleetRegistry } {
+export function initPlan(input: { domain: string; node: string; script: string; operator?: string; operatorPort?: number; edge?: FleetEdge; layout?: FleetLayout }): { steps: FleetStep[]; registry: FleetRegistry } {
   assertDomain(input.domain);
   if (input.operator) assertUnixUser(input.operator);
+  if (input.operatorPort !== undefined) {
+    if (!input.operator) throw new Error("--operator-port needs --operator, the user whose workspace listens there");
+    if (!Number.isInteger(input.operatorPort) || input.operatorPort < 1 || input.operatorPort >= FLEET_FIRST_PORT - 1) throw new Error(`--operator-port must be below ${FLEET_FIRST_PORT - 1}, where workspace ports start`);
+  }
+  if (input.edge) assertEdge(input.edge);
+  if (input.edge && input.operatorPort !== undefined && [input.operatorPort, input.operatorPort + 1].includes(input.edge.port)) throw new Error("--edge-port must differ from --operator-port and the webhook port after it");
   const layout = input.layout ?? fleetLayout();
-  const registry: FleetRegistry = { ...emptyRegistry(input.domain.toLowerCase()), ...(input.operator ? { operator: input.operator } : {}) };
+  const registry: FleetRegistry = {
+    ...emptyRegistry(input.domain.toLowerCase()),
+    ...(input.operator ? { operator: input.operator } : {}),
+    ...(input.operatorPort !== undefined ? { operatorPort: input.operatorPort } : {}),
+    ...(input.edge ? { edge: input.edge } : {}),
+  };
+  const dnsNote = input.edge
+    ? `point *.${registry.domain} at your proxy, which sends it to this server's port ${input.edge.port} over plain HTTP; only ${input.edge.proxy} may connect there`
+    : `point *.${registry.domain} at this server (a wildcard A/AAAA record); each workspace gets its own certificate when created`;
   const steps: FleetStep[] = [
     { kind: "mkdir", path: layout.etcDir, mode: 0o755 },
     { kind: "mkdir", path: layout.instancesDir, mode: 0o700 },
@@ -307,7 +392,7 @@ export function initPlan(input: { domain: string; node: string; script: string; 
     { kind: "mkdir", path: layout.auditFile.replace(/\/[^/]+$/, ""), mode: 0o750 },
     { kind: "write", path: layout.registryFile, content: `${JSON.stringify(registry, null, 2)}\n`, mode: 0o600 },
     { kind: "write", path: layout.unitFile, content: templateUnit({ node: input.node, script: input.script, layout }), mode: 0o644 },
-    { kind: "write", path: layout.fenceFile, content: fenceRules([]), mode: 0o600 },
+    { kind: "write", path: layout.fenceFile, content: registryFence(registry), mode: 0o600 },
     { kind: "write", path: layout.fenceUnitFile, content: fenceUnit(layout), mode: 0o644 },
     ...(input.operator ? [{ kind: "write" as const, path: layout.agentUnitFile, content: agentUnit({ node: input.node, script: input.script, operator: input.operator, layout }), mode: 0o644 }] : []),
     { kind: "append-once", path: layout.caddyfile, line: caddyImportLine(layout) },
@@ -315,7 +400,7 @@ export function initPlan(input: { domain: string; node: string; script: string; 
     { kind: "run", argv: ["systemctl", "enable", "--now", "openmausbot-fence.service"], why: "apply the loopback fence now and at boot" },
     ...(input.operator ? [{ kind: "run" as const, argv: ["systemctl", "enable", "--now", "openmausbot-fleet.service"], why: `start the fleet agent for ${input.operator}` }] : []),
     { kind: "run", argv: ["systemctl", "reload", "caddy"], why: "start serving the workspaces folder" },
-    { kind: "note", text: `point *.${registry.domain} at this server (a wildcard A/AAAA record); each workspace gets its own certificate when created` },
+    { kind: "note", text: dnsNote },
     ...(input.operator ? [{ kind: "note" as const, text: `the installation running as ${input.operator} can now manage installations from Settings → Installations` }] : []),
   ];
   return { steps, registry };
@@ -389,13 +474,13 @@ export function createPlan(input: {
           { kind: "write" as const, path: join(layout.unitFile.replace(/openmausbot@\.service$/, ""), `openmausbot@${workspace.slug}.service.d`, "limits.conf"), content: `[Service]\nMemoryMax=${input.memoryMax}\n`, mode: 0o644 },
         ]
       : []),
-    { kind: "write", path: layout.fenceFile, content: fenceRules(Object.values(registry.workspaces)), mode: 0o600 },
+    { kind: "write", path: layout.fenceFile, content: registryFence(registry), mode: 0o600 },
     { kind: "run", argv: ["nft", "-f", layout.fenceFile], why: "fence the new ports to their user" },
     { kind: "run", argv: ["systemctl", "daemon-reload"], why: "pick up the workspace's environment and limits" },
     { kind: "run", argv: ["systemctl", "enable", "--now", `openmausbot@${workspace.slug}.service`], why: "start the workspace now and at boot" },
     { kind: "health", url: `http://127.0.0.1:${workspace.port}/api/health`, why: "wait for the workspace to answer" },
-    { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace), mode: 0o644 },
-    { kind: "run", argv: ["systemctl", "reload", "caddy"], why: `serve https://${workspace.host} and fetch its certificate` },
+    { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 },
+    { kind: "run", argv: ["systemctl", "reload", "caddy"], why: registry.edge ? `serve ${workspace.host} to the proxy` : `serve https://${workspace.host} and fetch its certificate` },
     { kind: "write", path: layout.registryFile, content: `${JSON.stringify(registry, null, 2)}\n`, mode: 0o600 },
     { kind: "note", text: `https://${workspace.host} is ready; ${input.seed.admins[0]} signs in with an emailed code` },
   ];
@@ -423,7 +508,7 @@ export function suspendPlan(input: { registry: FleetRegistry; slug: string; layo
     registry,
     steps: [
       { kind: "run", argv: ["systemctl", "disable", "--now", `openmausbot@${workspace.slug}.service`], why: "stop the workspace and keep it stopped at boot" },
-      { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace), mode: 0o644 },
+      { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 },
       { kind: "run", argv: ["systemctl", "reload", "caddy"], why: "show the suspended page instead" },
       { kind: "write", path: layout.registryFile, content: `${JSON.stringify(registry, null, 2)}\n`, mode: 0o600 },
     ],
@@ -438,7 +523,7 @@ export function resumePlan(input: { registry: FleetRegistry; slug: string; layou
     steps: [
       { kind: "run", argv: ["systemctl", "enable", "--now", `openmausbot@${workspace.slug}.service`], why: "start the workspace again" },
       { kind: "health", url: `http://127.0.0.1:${workspace.port}/api/health`, why: "wait for the workspace to answer" },
-      { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace), mode: 0o644 },
+      { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 },
       { kind: "run", argv: ["systemctl", "reload", "caddy"], why: "serve it again" },
       { kind: "write", path: layout.registryFile, content: `${JSON.stringify(registry, null, 2)}\n`, mode: 0o600 },
     ],
@@ -462,7 +547,7 @@ export function deletePlan(input: { registry: FleetRegistry; slug: string; keepD
       { kind: "run", argv: ["systemctl", "reload", "caddy"], why: "stop serving its address" },
       { kind: "remove", path: join(layout.instancesDir, `${workspace.slug}.env`) },
       { kind: "remove", path: join(unitsDir, `openmausbot@${workspace.slug}.service.d`, "limits.conf") },
-      { kind: "write", path: layout.fenceFile, content: fenceRules(Object.values(registry.workspaces)), mode: 0o600 },
+      { kind: "write", path: layout.fenceFile, content: registryFence(registry), mode: 0o600 },
       { kind: "run", argv: ["nft", "-f", layout.fenceFile], why: input.keepData ? "keep the retained account's fence" : "drop its fence rule" },
       // Keep the nologin account too: recycling its UID would hand the preserved home to a new workspace.
       ...(input.keepData
@@ -473,10 +558,17 @@ export function deletePlan(input: { registry: FleetRegistry; slug: string; keepD
   };
 }
 
-export function upgradePlan(input: { registry: FleetRegistry }): FleetStep[] {
+/** Whether `script` is the CLI of `npm install -g openmausbot`, which `upgrade` may replace with the latest release. */
+export function npmInstalled(script: string): boolean {
+  return script.replace(/\\/g, "/").includes("/node_modules/openmausbot/");
+}
+
+export function upgradePlan(input: { registry: FleetRegistry; script: string }): FleetStep[] {
   const running = Object.values(input.registry.workspaces).filter((workspace) => workspace.status === "running").sort((a, b) => a.slug.localeCompare(b.slug));
   return [
-    { kind: "run", argv: ["npm", "install", "-g", "openmausbot@latest"], why: "install the release every workspace runs from" },
+    npmInstalled(input.script)
+      ? { kind: "run", argv: ["npm", "install", "-g", "openmausbot@latest"], why: "install the release every workspace runs from" }
+      : { kind: "note", text: `the workspaces run ${input.script}, which is not an npm install: update it first; this restarts them on what is there now` },
     ...running.map((workspace) => ({ kind: "run" as const, argv: ["systemctl", "restart", `openmausbot@${workspace.slug}.service`], why: `restart ${workspace.slug} on the new release` })),
     ...running.map((workspace) => ({ kind: "health" as const, url: `http://127.0.0.1:${workspace.port}/api/health`, why: `wait for ${workspace.slug}` })),
   ];

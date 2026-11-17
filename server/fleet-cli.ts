@@ -9,21 +9,23 @@ import {
   assertManagedWorkspace,
   assertSlug,
   assertUnixUser,
+  caddySite,
   createPlan,
   deletePlan,
   describeSteps,
   fleetLayout,
   fleetUser,
-  fenceRules,
   initPlan,
   MANAGED_OPENROUTER,
   managedOpenRouterModels,
   parseRegistry,
+  registryFence,
   resumePlan,
   suspendPlan,
   upgradePlan,
   workspaceDataDir,
   workspaceHome,
+  type FleetEdge,
   type FleetLayout,
   type FleetRegistry,
   type FleetStep,
@@ -35,6 +37,10 @@ export interface FleetInput {
   domain?: string;
   /** The operator's Unix user: the one workspace allowed to talk to the fleet agent. */
   operator?: string;
+  /** `init --behind-proxy IP [--edge-port N]`: TLS ends at that proxy; a later init without it keeps the saved one. */
+  edge?: FleetEdge;
+  /** `init --operator-port N`: the operator workspace's port, fenced to the operator; kept like `edge`. */
+  operatorPort?: number;
   admins: string[];
   members: string[];
   brandFile?: string;
@@ -303,14 +309,23 @@ export function planFleetAction(input: FleetInput, deps: FleetDeps): FleetStep[]
       const existing = deps.readText(layout.registryFile);
       if (existing !== null && !input.yes) throw new Error(`${layout.registryFile} exists; pass --yes to rewrite the template unit and fence (workspaces are kept)`);
       const kept = existing !== null ? parseRegistry(existing) : undefined;
-      const plan = initPlan({ domain: input.domain, node: input.node, script: input.script, operator: input.operator ?? kept?.operator, layout });
+      const edge = input.edge ?? kept?.edge;
+      const operatorPort = input.operatorPort ?? kept?.operatorPort;
+      const plan = initPlan({
+        domain: input.domain, node: input.node, script: input.script, operator: input.operator ?? kept?.operator,
+        ...(operatorPort !== undefined ? { operatorPort } : {}), ...(edge ? { edge } : {}), layout,
+      });
       if (kept) {
         // Reinitializing templates must not erase reservations or open sibling ports.
         const registry = { ...kept, ...plan.registry, workspaces: kept.workspaces, nextPort: kept.nextPort };
+        const sites: FleetStep[] = Object.values(registry.workspaces)
+          .filter((workspace) => workspace.status === "running" || workspace.status === "suspended")
+          .map((workspace) => ({ kind: "write", path: posix.join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 }));
         return plan.steps.flatMap((step): FleetStep[] => {
           if (step.kind === "write" && step.path === layout.registryFile) return [{ ...step, content: `${JSON.stringify(registry, null, 2)}\n` }];
-          if (step.kind === "write" && step.path === layout.fenceFile) return [{ ...step, content: fenceRules(Object.values(registry.workspaces)) }];
+          if (step.kind === "write" && step.path === layout.fenceFile) return [{ ...step, content: registryFence(registry) }];
           if (step.kind === "run" && step.argv.join(" ") === "systemctl enable --now openmausbot-fence.service") return [step, { kind: "run", argv: ["nft", "-f", layout.fenceFile], why: "reapply the preserved workspace fence" }];
+          if (step.kind === "run" && step.argv.join(" ") === "systemctl reload caddy") return [...sites, step];
           return [step];
         });
       }
@@ -394,7 +409,7 @@ export function planFleetAction(input: FleetInput, deps: FleetDeps): FleetStep[]
       return deletePlan({ registry, slug: input.slug, keepData: input.keepData, layout }).steps;
     }
     case "upgrade":
-      return upgradePlan({ registry: loadRegistry(layout, deps) });
+      return upgradePlan({ registry: loadRegistry(layout, deps), script: input.script });
     case "list":
       return [];
   }

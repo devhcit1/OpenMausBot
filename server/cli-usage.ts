@@ -61,7 +61,7 @@ export const USAGE = `openmausbot — your team of AI bots, ready in a few steps
   openmausbot sentinel [--data-dir DIR] [--out DIR] [--once] [--json]   (read-only health scan; see --help)
   openmausbot config backups | restore NAME    (dated copies of the settings file; see --help)
   openmausbot browser install [--with-deps] | status
-  openmausbot fleet init --domain HOST [--operator USER] | create NAME --admin EMAIL [--member EMAIL] [--brand FILE]
+  openmausbot fleet init --domain HOST [--operator USER [--operator-port N]] [--behind-proxy IP [--edge-port 8800]] | create NAME --admin EMAIL [--member EMAIL] [--brand FILE]
                     [--anthropic-key-file FILE] [--cap USD] [--license-key KEY] [--memory 1G]
                   | list | users NAME add|remove EMAIL [--chat-only] | suspend NAME | resume NAME
                   | delete NAME --yes [--keep-data] | upgrade   (all take --dry-run)

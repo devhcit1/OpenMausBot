@@ -87,6 +87,24 @@ describe("openmausbot fleet", () => {
     expect(rooted.calls).toEqual([]);
   });
 
+  it("moves an existing fleet behind a proxy: every live site is rewritten before Caddy reloads, and the edge is kept", async () => {
+    const acme: FleetWorkspace = { slug: "acme", host: "acme.agentada.cc", port: 8810, webhookPort: 8811, status: "running", createdAt: "" };
+    const gone: FleetWorkspace = { ...acme, slug: "gone", host: "gone.agentada.cc", port: 8820, webhookPort: 8821, status: "retained" };
+    const { deps, calls, files } = machine({ root: true, files: withRegistry({ acme, gone }) });
+    const edge = { proxy: "172.17.0.24", port: 8800 };
+    expect(await runFleetCommand({ ...base, action: "init", domain: "agentada.cc", yes: true, edge }, io().io, deps)).toBe(0);
+    expect(JSON.parse(files.get(registryFile)!).edge).toEqual(edge);
+    expect(files.get("/etc/caddy/omb.d/acme.caddy")).toContain("http://acme.agentada.cc:8800 {");
+    expect(files.has("/etc/caddy/omb.d/gone.caddy")).toBe(false);
+    expect(calls.indexOf("write /etc/caddy/omb.d/acme.caddy 644")).toBeLessThan(calls.indexOf("run systemctl reload caddy"));
+
+    expect(await runFleetCommand({ ...base, action: "init", domain: "agentada.cc", operator: "maus", operatorPort: 8080, yes: true }, io().io, deps)).toBe(0);
+    expect(await runFleetCommand({ ...base, action: "init", domain: "agentada.cc", yes: true }, io().io, deps)).toBe(0);
+    expect(JSON.parse(files.get(registryFile)!)).toMatchObject({ edge, operator: "maus", operatorPort: 8080 });
+    expect(files.get("/etc/openmausbot/fence.nft")).toContain("dport { 8080, 8081 } meta skuid != { maus, root } reject");
+    expect(files.get("/etc/openmausbot/fence.nft")).toContain("omb-gone");
+  });
+
   it("refuses an npx cache as the unit's script and asks for the domain", async () => {
     const { deps } = machine({ root: true });
     const bad = io();

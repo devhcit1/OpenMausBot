@@ -37,6 +37,9 @@ describe("openmausbot command line", () => {
     expect(parseArgs(["fleet", "delete", "acme", "--yes", "--keep-data"], {})).toMatchObject({ fleetAction: "delete", slug: "acme", yes: true, keepData: true });
     expect(parseArgs(["fleet", "init", "--domain", "AgentAda.cc", "--operator", "maus"], {})).toMatchObject({ fleetAction: "init", domain: "agentada.cc", operator: "maus" });
     expect(parseArgs(["fleet", "agent", "--socket", "/run/x.sock", "--group", "maus"], {})).toMatchObject({ fleetAction: "agent", socket: "/run/x.sock", group: "maus" });
+    expect(parseArgs(["fleet", "init", "--domain", "ai.example.test", "--behind-proxy", "172.17.0.24", "--edge-port", "8700"], {})).toMatchObject({ behindProxy: "172.17.0.24", edgePort: 8700 });
+    expect(parseArgs(["fleet", "init", "--domain", "ai.example.test", "--edge-port", "8700"], {})).toMatchObject({ error: expect.stringContaining("needs --behind-proxy") });
+    expect(parseArgs(["fleet", "create", "acme", "--behind-proxy", "172.17.0.24"], {})).toMatchObject({ error: expect.stringContaining("belong to fleet init") });
     expect(parseArgs(["fleet"], {})).toMatchObject({ error: expect.stringContaining("fleet needs one of") });
     expect(parseArgs(["fleet", "create"], {})).toMatchObject({ error: "fleet create needs a workspace name" });
     expect(parseArgs(["fleet", "users", "acme"], {})).toMatchObject({ error: expect.stringContaining("add|remove") });
