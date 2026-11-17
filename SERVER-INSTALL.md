@@ -397,6 +397,9 @@ A workspace whose sandbox can't start doesn't start at all. Check one with
 `journalctl -u openmausbot@NAME | grep "bot box"`. Expect `bot box: on` and
 a passing self-check.
 
+Nothing a customer's Unix user runs can reach a private or LAN address, apart
+from DNS. That covers its server and its desktops.
+
 Placeholder: `FLEET_DOMAIN` is the domain whose subdomains the workspaces
 use, for example `ai.hcitprofessionals.us`.
 
@@ -442,9 +445,26 @@ sudo openmausbot fleet create acme --admin owner@acme.example --memory 2G --cap 
   its admin adds a key in Settings.
 - `--memory` caps the workspace's RAM; `--cap` caps its monthly spending in
   dollars.
+- `--desktops` gives its bots Private desktops (see below).
 
 The admin opens `https://acme.FLEET_DOMAIN` and signs in with a code sent
 to their email.
+
+**Desktops for a customer.** Add `--desktops` when you create the workspace.
+Its desktops run as the workspace's own user, through rootless Podman. The
+customer's admin then opens **Settings → Bot desktops → Prepare Cua desktop**,
+as in C3.
+
+- **Disk:** each workspace keeps its own copy of the desktop image, a few GB.
+  Allow that, plus each desktop's disk, for every customer with desktops.
+- **RAM:** desktops run outside the workspace's service, so `--memory` doesn't
+  cap them. Keep RAM free for them.
+- **Network:** a desktop reaches the public internet and DNS, but not your LAN
+  or this server.
+- **Suspend and delete** stop the workspace's desktops too.
+
+A workspace created without `--desktops` can't get them later. To add them,
+delete it and create it again.
 
 ### D5. Day to day
 

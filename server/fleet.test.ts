@@ -6,6 +6,7 @@ import {
   caddySite,
   createPlan,
   deletePlan,
+  DESKTOPS_DROP_IN,
   describeSteps,
   emptyRegistry,
   fenceRules,
@@ -73,7 +74,7 @@ describe("rendered files", () => {
     ]);
     expect(rules).toContain("add table inet openmausbot\nflush table inet openmausbot");
     expect(rules.indexOf("omb-acme")).toBeLessThan(rules.indexOf("omb-globex"));
-    expect(rules).toContain("oif lo tcp dport { 8810, 8811 } meta skuid != { omb-acme, caddy, root } reject");
+    expect(rules).toContain("oif lo tcp dport { 8810, 8811, 8812 } meta skuid != { omb-acme, caddy, root } reject");
     expect(fenceRules([])).not.toContain("reject");
     const incomplete: FleetWorkspace = { slug: "pending", host: "pending.x", port: 8830, webhookPort: 8831, status: "provisioning", createdAt: "" };
     expect(fenceRules([incomplete])).not.toContain("omb-pending");
@@ -97,7 +98,7 @@ describe("rendered files", () => {
   it("writes the environment, the first config and the sign-in edits the server reads live", () => {
     const workspace: FleetWorkspace = { slug: "acme", host: "acme.agentada.cc", port: 8810, webhookPort: 8811, status: "running", createdAt: "" };
     expect(instanceEnv({ workspace, dataDir: "/var/lib/openmausbot/acme/.openmausbot", licenseKey: "omb1.k" })).toBe(
-      "OMB_DATA_DIR=/var/lib/openmausbot/acme/.openmausbot\nOMB_PORT=8810\nOMB_WEBHOOK_PORT=8811\nOMB_PUBLIC_URL=https://acme.agentada.cc\nOMB_LICENSE_KEY=omb1.k\n",
+      "OMB_DATA_DIR=/var/lib/openmausbot/acme/.openmausbot\nOMB_PORT=8810\nOMB_WEBHOOK_PORT=8811\nOMB_VM_VIEWER_PORT=8812\nOMB_PUBLIC_URL=https://acme.agentada.cc\nOMB_LICENSE_KEY=omb1.k\n",
     );
     expect(JSON.parse(initialConfig({ admins: ["ada@example.test"], members: ["@acme.test"], anthropicKey: "sk-ant-x", monthlyCapUsd: 50 }))).toEqual({
       signIn: { admins: ["ada@example.test"], members: ["@acme.test"] }, anthropic: { key: "sk-ant-x" }, budgets: { monthlyUsd: 50 },
@@ -224,6 +225,44 @@ describe("plans", () => {
     expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", edge: { proxy: "pfsense.lan", port: 8800 }, layout })).toThrow("not an IP address");
     expect(() => initPlan({ domain: "ai.example.test", node: "n", script: "s", edge: { proxy: "10.0.0.1", port: 8810 }, layout })).toThrow("below 8810");
     expect(() => parseRegistry(JSON.stringify({ ...registry, edge: { proxy: "x", port: 1 } }))).toThrow("not an IP address");
+  });
+
+  it("keeps everything a workspace's user runs off the LAN, except DNS", () => {
+    const rules = fenceRules([{ slug: "acme", host: "acme.x", port: 8810, webhookPort: 8811, status: "running", createdAt: "" }]);
+    expect(rules).toContain("set lan4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } }");
+    expect(rules).toContain("set lan6 { type ipv6_addr; flags interval; elements = { fc00::/7, fe80::/10 } }");
+    const acme = rules.split("\n").filter((line) => line.includes("skuid omb-acme"));
+    expect(acme).toEqual([
+      "\t\tmeta skuid omb-acme ip daddr @lan4 meta l4proto { tcp, udp } th dport 53 accept",
+      "\t\tmeta skuid omb-acme ip daddr @lan4 reject",
+      "\t\tmeta skuid omb-acme ip6 daddr @lan6 meta l4proto { tcp, udp } th dport 53 accept",
+      "\t\tmeta skuid omb-acme ip6 daddr @lan6 reject",
+    ]);
+  });
+
+  it("gives a workspace with desktops its user ranges, lingering and the override, and stops them with it", () => {
+    const unitDir = "/etc/systemd/system/openmausbot@acme.service.d";
+    const plain = createPlan({ registry: emptyRegistry("ai.example.test"), slug: "acme", seed: { admins: ["a@b.test"], members: [] }, now, layout });
+    expect(plain.workspace).not.toHaveProperty("desktops");
+    expect(argvOf(plain.steps).join("\n")).not.toMatch(/subids|linger/);
+    expect(writesOf(plain.steps)).not.toContain(`${unitDir}/desktops.conf`);
+
+    const created = createPlan({ registry: emptyRegistry("ai.example.test"), slug: "acme", seed: { admins: ["a@b.test"], members: [] }, desktops: true, now, layout });
+    expect(created.workspace.desktops).toBe(true);
+    expect(argvOf(created.steps)[0]).toBe("useradd --system --add-subids-for-system --create-home --home-dir /var/lib/openmausbot/acme --shell /usr/sbin/nologin --user-group omb-acme");
+    expect(created.steps.find((step) => step.kind === "write" && step.path === `${unitDir}/desktops.conf`)).toMatchObject({ content: DESKTOPS_DROP_IN });
+    for (const line of ["NoNewPrivileges=no", "ProtectHome=no", "ProtectSystem=full", "InaccessiblePaths=-/home -/root"]) expect(DESKTOPS_DROP_IN).toContain(line);
+    expect(DESKTOPS_DROP_IN).not.toContain("ReadWritePaths");
+    const order = argvOf(created.steps);
+    expect(order.indexOf("loginctl enable-linger omb-acme")).toBeLessThan(order.indexOf("systemctl enable --now openmausbot@acme.service"));
+
+    const suspended = suspendPlan({ registry: created.registry, slug: "acme", layout });
+    expect(argvOf(suspended.steps)).toEqual(["systemctl disable --now openmausbot@acme.service", "loginctl disable-linger omb-acme", "loginctl terminate-user omb-acme", "systemctl reload caddy"]);
+    expect(argvOf(resumePlan({ registry: suspended.registry, slug: "acme", layout }).steps)).toEqual(["loginctl enable-linger omb-acme", "systemctl enable --now openmausbot@acme.service", "systemctl reload caddy"]);
+    const deleted = deletePlan({ registry: created.registry, slug: "acme", keepData: false, layout });
+    const deleteOrder = argvOf(deleted.steps);
+    expect(deleteOrder.indexOf("loginctl terminate-user omb-acme")).toBeLessThan(deleteOrder.indexOf("userdel --remove omb-acme"));
+    expect(deleted.steps).toContainEqual({ kind: "remove", path: `${unitDir}/desktops.conf` });
   });
 
   it("fences the operator's own workspace to the operator, in every fence a plan writes", () => {

@@ -4,15 +4,17 @@ import { emptyRegistry, fenceRules, MANAGED_OPENROUTER, type FleetWorkspace } fr
 
 // A machine that records what the CLI would do to it. Nothing here touches
 // the real filesystem, systemd, nftables or Caddy.
-function machine(options: { root?: boolean; files?: Record<string, string>; failing?: string[] } = {}) {
+function machine(options: { root?: boolean; files?: Record<string, string>; failing?: string[]; busyPolls?: number } = {}) {
   const files = new Map(Object.entries(options.files ?? {}));
   const calls: string[] = [];
+  let busyPolls = options.busyPolls ?? 0;
   const deps: FleetDeps = {
     isRoot: () => options.root ?? false,
     run: async (argv) => {
       calls.push(`run ${argv.join(" ")}`);
       const failing = options.failing?.some((prefix) => argv.join(" ").startsWith(prefix));
       if (argv[0] === "systemctl" && argv[1] === "is-active") return { code: 0, output: "active\n" };
+      if (argv[0] === "pgrep") return { code: busyPolls-- > 0 ? 0 : 1, output: "" };
       return failing ? { code: 1, output: "Failed to start: boom secret-token\n" } : { code: 0, output: "" };
     },
     pathExists: (path) => files.has(path),
@@ -22,6 +24,7 @@ function machine(options: { root?: boolean; files?: Record<string, string>; fail
     mkdir: (path, mode, owner) => { calls.push(`mkdir ${path} ${mode.toString(8)}${owner ? ` as ${owner}` : ""}`); },
     appendOnce: (path, line) => { calls.push(`append ${path} ${line}`); },
     remove: (path) => { calls.push(`remove ${path}`); files.delete(path); },
+    uid: () => 991,
     health: async (url) => { calls.push(`health ${url}`); return !options.failing?.includes("health"); },
   };
   return { deps, calls, files };
@@ -103,6 +106,26 @@ describe("openmausbot fleet", () => {
     expect(JSON.parse(files.get(registryFile)!)).toMatchObject({ edge, operator: "maus", operatorPort: 8080 });
     expect(files.get("/etc/openmausbot/fence.nft")).toContain("dport { 8080, 8081 } meta skuid != { maus, root } reject");
     expect(files.get("/etc/openmausbot/fence.nft")).toContain("omb-gone");
+  });
+
+  it("orders a desktop workspace after its user manager, named by the UID the new account got", async () => {
+    const { deps, calls, files } = machine({ root: true, files: withRegistry() });
+    expect(await runFleetCommand({ ...base, action: "create", slug: "acme", admins: ["a@b.test"], desktops: true }, io().io, deps)).toBe(0);
+    const unitDir = "/etc/systemd/system/openmausbot@acme.service.d";
+    expect(files.get(`${unitDir}/user-manager.conf`)).toBe("[Unit]\nRequires=user@991.service\nAfter=user@991.service\n");
+    expect(calls.indexOf(`write ${unitDir}/user-manager.conf 644`)).toBeGreaterThan(calls.findIndex((call) => call.startsWith("run useradd")));
+    expect(calls.indexOf(`write ${unitDir}/user-manager.conf 644`)).toBeLessThan(calls.indexOf("run systemctl daemon-reload"));
+  });
+
+  it("deletes a workspace with desktops only once its user's last process has ended, and repeats cleanly", async () => {
+    const acme: FleetWorkspace = { slug: "acme", host: "acme.agentada.cc", port: 8810, webhookPort: 8811, status: "running", createdAt: "", desktops: true };
+    const { deps, calls } = machine({ root: true, files: withRegistry({ acme }), busyPolls: 2, failing: ["loginctl terminate-user"] });
+    expect(await runFleetCommand({ ...base, action: "delete", slug: "acme", yes: true }, io().io, deps)).toBe(0);
+    const runs = calls.filter((call) => call.startsWith("run "));
+    expect(runs.filter((call) => call === "run pgrep -u omb-acme")).toHaveLength(3);
+    expect(runs.indexOf("run loginctl terminate-user omb-acme")).toBeLessThan(runs.indexOf("run pgrep -u omb-acme"));
+    expect(runs.at(-1)).toBe("run userdel --remove omb-acme");
+    expect(calls).toContain("remove /etc/systemd/system/openmausbot@acme.service.d");
   });
 
   it("refuses an npx cache as the unit's script and asks for the domain", async () => {

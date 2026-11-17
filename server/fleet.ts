@@ -79,6 +79,8 @@ export interface FleetWorkspace {
   createdAt: string;
   /** Incomplete provisioning keeps its fence once the Unix account exists. */
   accountCreated?: boolean;
+  /** Its bots get Private desktops: rootless Podman as the workspace's user, kept running by lingering. */
+  desktops?: true;
 }
 
 /**
@@ -135,6 +137,11 @@ export function parseRegistry(text: string): FleetRegistry {
   };
 }
 
+/** The loopback port of a workspace's shared desktop viewer: the third of its block. */
+export function viewerPort(workspace: Pick<FleetWorkspace, "port">): number {
+  return workspace.port + 2;
+}
+
 export function fleetUser(slug: string): string {
   return `${FLEET_USER_PREFIX}${slug}`;
 }
@@ -165,8 +172,13 @@ export type FleetStep =
   | { kind: "write"; path: string; content: string; mode: number; owner?: string }
   | { kind: "append-once"; path: string; line: string }
   | { kind: "remove"; path: string }
-  | { kind: "run"; argv: string[]; why: string }
+  /** `tolerate`: the step's goal may already hold, as when a stopped user manager is told to stop again. */
+  | { kind: "run"; argv: string[]; why: string; tolerate?: true }
   | { kind: "health"; url: string; why: string }
+  /** Waits until `user` runs no process, as userdel requires. */
+  | { kind: "quiesce"; user: string; why: string }
+  /** Writes `path` ordering a unit after `user`'s systemd user manager, named by the UID only known once `user` exists. */
+  | { kind: "after-user-manager"; user: string; path: string }
   | { kind: "note"; text: string };
 
 /** The one unit every workspace runs from; `%i` is the slug. */
@@ -226,20 +238,71 @@ export function fenceUnit(layout = fleetLayout()): string {
   ].join("\n");
 }
 
+/** Private, shared, link-local and unique-local ranges: the LAN, this server's own addresses and cloud metadata. */
+export const FLEET_LAN_V4 = ["10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"];
+export const FLEET_LAN_V6 = ["fc00::/7", "fe80::/10"];
+
 /**
  * nftables: only a workspace's own user, Caddy and root may open its loopback ports, so a bot's shell cannot reach a
  * sibling's API. Security: the operator's workspace trusts its loopback callers as its owner, so its ports are fenced
- * to the operator's user and root too, or any workspace's bot could act as the operator.
+ * to the operator's user and root too, or any workspace's bot could act as the operator. Nothing a workspace's user runs
+ * (its server, its desktops' rootless network) reaches the LAN or this server's LAN addresses, except DNS: a desktop's
+ * resolver is the host's, which is often the LAN's router.
  */
 export function fenceRules(workspaces: FleetWorkspace[], operator?: { user: string; port: number }): string {
-  const lines = ["#!/usr/sbin/nft -f", "# Written by `openmausbot fleet`; regenerated on every create, suspend, resume and delete.", "add table inet openmausbot", "flush table inet openmausbot", "table inet openmausbot {", "\tchain output {", "\t\ttype filter hook output priority 0; policy accept;"];
+  const lines = [
+    "#!/usr/sbin/nft -f", "# Written by `openmausbot fleet`; regenerated on every create, suspend, resume and delete.",
+    "add table inet openmausbot", "flush table inet openmausbot", "table inet openmausbot {",
+    `\tset lan4 { type ipv4_addr; flags interval; elements = { ${FLEET_LAN_V4.join(", ")} } }`,
+    `\tset lan6 { type ipv6_addr; flags interval; elements = { ${FLEET_LAN_V6.join(", ")} } }`,
+    "\tchain output {", "\t\ttype filter hook output priority 0; policy accept;",
+  ];
   if (operator) lines.push(`\t\toif lo tcp dport { ${operator.port}, ${operator.port + 1} } meta skuid != { ${operator.user}, root } reject`);
   for (const workspace of [...workspaces].sort((a, b) => a.slug.localeCompare(b.slug))) {
     if (workspace.status !== "running" && workspace.status !== "suspended" && workspace.status !== "retained" && !workspace.accountCreated) continue;
-    lines.push(`\t\toif lo tcp dport { ${workspace.port}, ${workspace.webhookPort} } meta skuid != { ${fleetUser(workspace.slug)}, caddy, root } reject`);
+    const user = fleetUser(workspace.slug);
+    lines.push(`\t\toif lo tcp dport { ${workspace.port}, ${workspace.webhookPort}, ${viewerPort(workspace)} } meta skuid != { ${user}, caddy, root } reject`);
+    for (const [family, set] of [["ip", "@lan4"], ["ip6", "@lan6"]] as const) {
+      lines.push(
+        `\t\tmeta skuid ${user} ${family} daddr ${set} meta l4proto { tcp, udp } th dport 53 accept`,
+        `\t\tmeta skuid ${user} ${family} daddr ${set} reject`,
+      );
+    }
   }
   lines.push("\t}", "}", "");
   return lines.join("\n");
+}
+
+/**
+ * The override a workspace with desktops runs under. Rootless Podman maps users with the setuid newuidmap, which
+ * no-new-privileges would refuse, and keeps its state in /run/user/UID, which ProtectHome hides and
+ * ProtectSystem=strict makes read-only. `full` leaves /run as the host's: a ReadWritePaths bind of /run/user would
+ * freeze it at service start, hiding the user's runtime folder when systemd mounts it later (systemd 255). Bots keep
+ * no-new-privileges all the same: bubblewrap sets it in every box.
+ */
+export const DESKTOPS_DROP_IN = [
+  "[Service]",
+  "NoNewPrivileges=no",
+  "ProtectHome=no",
+  "ProtectSystem=full",
+  "InaccessiblePaths=-/home -/root",
+  "",
+].join("\n");
+
+export function desktopsDropInPath(layout: FleetLayout, slug: string): string {
+  return join(layout.unitFile.replace(/openmausbot@\.service$/, ""), `openmausbot@${slug}.service.d`, "desktops.conf");
+}
+
+export function userManagerDropInPath(layout: FleetLayout, slug: string): string {
+  return join(layout.unitFile.replace(/openmausbot@\.service$/, ""), `openmausbot@${slug}.service.d`, "user-manager.conf");
+}
+
+/**
+ * systemd mounts a user's runtime folder with private propagation, so a service must start after it to see it:
+ * started first, the service keeps the bare mount point, and rootless Podman there refuses to run.
+ */
+export function userManagerDropIn(uid: number): string {
+  return `[Unit]\nRequires=user@${uid}.service\nAfter=user@${uid}.service\n`;
 }
 
 /** The whole fence for a registry. */
@@ -310,6 +373,7 @@ export function instanceEnv(input: { workspace: FleetWorkspace; dataDir: string;
     `OMB_DATA_DIR=${input.dataDir}`,
     `OMB_PORT=${input.workspace.port}`,
     `OMB_WEBHOOK_PORT=${input.workspace.webhookPort}`,
+    `OMB_VM_VIEWER_PORT=${viewerPort(input.workspace)}`,
     `OMB_PUBLIC_URL=https://${input.workspace.host}`,
   ];
   if (input.licenseKey) lines.push(`OMB_LICENSE_KEY=${input.licenseKey}`);
@@ -414,6 +478,7 @@ export function createPlan(input: {
   seed: WorkspaceSeed;
   licenseKey?: string;
   memoryMax?: string;
+  desktops?: boolean;
   now?: Date;
   layout?: FleetLayout;
 }): { steps: FleetStep[]; registry: FleetRegistry; workspace: FleetWorkspace } {
@@ -443,8 +508,10 @@ export function createPlan(input: {
     webhookPort: port + 1,
     status: "running",
     createdAt: (input.now ?? new Date()).toISOString(),
+    ...(input.desktops ? { desktops: true as const } : {}),
   };
   const registry: FleetRegistry = { ...input.registry, nextPort: next, workspaces: { ...input.registry.workspaces, [workspace.slug]: workspace } };
+  const dropIns = join(layout.unitFile.replace(/openmausbot@\.service$/, ""), `openmausbot@${workspace.slug}.service.d`);
   const reserved = (accountCreated: boolean): FleetRegistry => ({
     ...registry,
     workspaces: { ...registry.workspaces, [workspace.slug]: { ...workspace, status: "provisioning", accountCreated } },
@@ -455,7 +522,11 @@ export function createPlan(input: {
   const steps: FleetStep[] = [
     // Reserve the identity and ports first: a crash leaves an inspectable reservation, never a silently reusable home.
     { kind: "write", path: layout.registryFile, content: `${JSON.stringify(reserved(false), null, 2)}\n`, mode: 0o600 },
-    { kind: "run", argv: ["useradd", "--system", "--create-home", "--home-dir", home, "--shell", "/usr/sbin/nologin", "--user-group", user], why: `the workspace's own account` },
+    {
+      kind: "run",
+      argv: ["useradd", "--system", ...(input.desktops ? ["--add-subids-for-system"] : []), "--create-home", "--home-dir", home, "--shell", "/usr/sbin/nologin", "--user-group", user],
+      why: input.desktops ? "the workspace's own account, with the user ranges its desktops map" : "the workspace's own account",
+    },
     { kind: "write", path: layout.registryFile, content: `${JSON.stringify(reserved(true), null, 2)}\n`, mode: 0o600 },
     { kind: "mkdir", path: dataDir, mode: 0o700, owner: user },
     { kind: "write", path: join(dataDir, "config.json"), content: initialConfig(input.seed), mode: 0o600, owner: user },
@@ -470,10 +541,13 @@ export function createPlan(input: {
     ] : []),
     ...(input.seed.brandJson ? [{ kind: "write" as const, path: join(dataDir, "brand.json"), content: input.seed.brandJson, mode: 0o600, owner: user }] : []),
     { kind: "write", path: join(layout.instancesDir, `${workspace.slug}.env`), content: instanceEnv({ workspace, dataDir, licenseKey: input.licenseKey, portalUrl: input.seed.portalUrl }), mode: 0o600 },
-    ...(input.memoryMax
+    ...(input.memoryMax || input.desktops ? [{ kind: "mkdir" as const, path: dropIns, mode: 0o755 }] : []),
+    ...(input.memoryMax ? [{ kind: "write" as const, path: join(dropIns, "limits.conf"), content: `[Service]\nMemoryMax=${input.memoryMax}\n`, mode: 0o644 }] : []),
+    ...(input.desktops
       ? [
-          { kind: "mkdir" as const, path: join(layout.unitFile.replace(/openmausbot@\.service$/, ""), `openmausbot@${workspace.slug}.service.d`), mode: 0o755 },
-          { kind: "write" as const, path: join(layout.unitFile.replace(/openmausbot@\.service$/, ""), `openmausbot@${workspace.slug}.service.d`, "limits.conf"), content: `[Service]\nMemoryMax=${input.memoryMax}\n`, mode: 0o644 },
+          { kind: "write" as const, path: desktopsDropInPath(layout, workspace.slug), content: DESKTOPS_DROP_IN, mode: 0o644 },
+          { kind: "after-user-manager" as const, user, path: userManagerDropInPath(layout, workspace.slug) },
+          { kind: "run" as const, argv: ["loginctl", "enable-linger", user], why: "keep the workspace's user manager, which runs its desktops, up at boot" },
         ]
       : []),
     { kind: "write", path: layout.fenceFile, content: registryFence(registry), mode: 0o600 },
@@ -487,6 +561,16 @@ export function createPlan(input: {
     { kind: "note", text: `https://${workspace.host} is ready; ${input.seed.admins[0]} signs in with an emailed code` },
   ];
   return { steps, registry, workspace };
+}
+
+/** Ends the user manager and with it every desktop container; without lingering it stays down until resumed. */
+function stopDesktops(workspace: FleetWorkspace): FleetStep[] {
+  if (!workspace.desktops) return [];
+  const user = fleetUser(workspace.slug);
+  return [
+    { kind: "run", argv: ["loginctl", "disable-linger", user], why: "stop keeping its desktops' user manager up" },
+    { kind: "run", argv: ["loginctl", "terminate-user", user], why: "stop its desktops", tolerate: true },
+  ];
 }
 
 /** Incomplete provisioning and retained homes need explicit operator recovery. */
@@ -510,6 +594,7 @@ export function suspendPlan(input: { registry: FleetRegistry; slug: string; layo
     registry,
     steps: [
       { kind: "run", argv: ["systemctl", "disable", "--now", `openmausbot@${workspace.slug}.service`], why: "stop the workspace and keep it stopped at boot" },
+      ...stopDesktops(workspace),
       { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 },
       { kind: "run", argv: ["systemctl", "reload", "caddy"], why: "show the suspended page instead" },
       { kind: "write", path: layout.registryFile, content: `${JSON.stringify(registry, null, 2)}\n`, mode: 0o600 },
@@ -523,6 +608,7 @@ export function resumePlan(input: { registry: FleetRegistry; slug: string; layou
   return {
     registry,
     steps: [
+      ...(workspace.desktops ? [{ kind: "run" as const, argv: ["loginctl", "enable-linger", fleetUser(workspace.slug)], why: "start its desktops' user manager again" }] : []),
       { kind: "run", argv: ["systemctl", "enable", "--now", `openmausbot@${workspace.slug}.service`], why: "start the workspace again" },
       { kind: "health", url: `http://127.0.0.1:${workspace.port}/api/health`, why: "wait for the workspace to answer" },
       { kind: "write", path: join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 },
@@ -545,16 +631,23 @@ export function deletePlan(input: { registry: FleetRegistry; slug: string; keepD
     registry,
     steps: [
       { kind: "run", argv: ["systemctl", "disable", "--now", `openmausbot@${workspace.slug}.service`], why: "stop the workspace" },
+      ...stopDesktops(workspace),
+      { kind: "remove", path: desktopsDropInPath(layout, workspace.slug) },
+      { kind: "remove", path: userManagerDropInPath(layout, workspace.slug) },
       { kind: "remove", path: join(layout.caddyDir, `${workspace.slug}.caddy`) },
       { kind: "run", argv: ["systemctl", "reload", "caddy"], why: "stop serving its address" },
       { kind: "remove", path: join(layout.instancesDir, `${workspace.slug}.env`) },
       { kind: "remove", path: join(unitsDir, `openmausbot@${workspace.slug}.service.d`, "limits.conf") },
+      { kind: "remove", path: join(unitsDir, `openmausbot@${workspace.slug}.service.d`) },
       { kind: "write", path: layout.fenceFile, content: registryFence(registry), mode: 0o600 },
       { kind: "run", argv: ["nft", "-f", layout.fenceFile], why: input.keepData ? "keep the retained account's fence" : "drop its fence rule" },
       // Keep the nologin account too: recycling its UID would hand the preserved home to a new workspace.
       ...(input.keepData
         ? [{ kind: "note" as const, text: "keeping the disabled workspace's account, home and name reserved; operator recovery is required before reuse" }]
-        : [{ kind: "run" as const, argv: ["userdel", "--remove", fleetUser(workspace.slug)], why: "remove the account and everything it owned" }]),
+        : [
+            { kind: "quiesce" as const, user: fleetUser(workspace.slug), why: "wait for the account's last process to end" },
+            { kind: "run" as const, argv: ["userdel", "--remove", fleetUser(workspace.slug)], why: "remove the account and everything it owned" },
+          ]),
       { kind: "write", path: layout.registryFile, content: `${JSON.stringify(registry, null, 2)}\n`, mode: 0o600 },
     ],
   };
@@ -623,10 +716,16 @@ export function describeSteps(steps: FleetStep[]): string[] {
         lines.push(`grep -qxF ${shellQuote(step.line)} ${shellQuote(step.path)} || printf '\\n%s\\n' ${shellQuote(step.line)} >> ${shellQuote(step.path)}`);
         break;
       case "remove":
-        lines.push(`rm -f ${shellQuote(step.path)}`);
+        lines.push(step.path.endsWith(".service.d") ? `rmdir --ignore-fail-on-non-empty ${shellQuote(step.path)} 2>/dev/null || true` : `rm -f ${shellQuote(step.path)}`);
         break;
       case "run":
-        lines.push(`${argvText(step.argv.map(shellQuote))}   # ${step.why}`);
+        lines.push(`${argvText(step.argv.map(shellQuote))}${step.tolerate ? " || true" : ""}   # ${step.why}`);
+        break;
+      case "quiesce":
+        lines.push(`while pgrep -u ${shellQuote(step.user)} >/dev/null; do sleep 1; done   # ${step.why}`);
+        break;
+      case "after-user-manager":
+        lines.push(`uid=$(id -u ${shellQuote(step.user)}) && printf '[Unit]\\nRequires=user@%s.service\\nAfter=user@%s.service\\n' "$uid" "$uid" > ${shellQuote(step.path)}`);
         break;
       case "health":
         lines.push(`until curl -sf ${shellQuote(step.url)} >/dev/null; do sleep 1; done   # ${step.why}`);

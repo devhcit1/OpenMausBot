@@ -109,6 +109,7 @@ export interface CliOptions {
   cap?: number;
   licenseKey?: string;
   memory?: string;
+  desktops?: boolean;
   dryRun?: boolean;
   yes?: boolean;
   keepData?: boolean;
@@ -205,6 +206,7 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
       else if (options.command === "fleet" && arg === "--cap") options.cap = Number(value());
       else if (options.command === "fleet" && arg === "--license-key") options.licenseKey = value();
       else if (options.command === "fleet" && arg === "--memory") options.memory = value();
+      else if (options.command === "fleet" && arg === "--desktops") options.desktops = true;
       else if (options.command === "fleet" && arg === "--dry-run") options.dryRun = true;
       else if (options.command === "fleet" && arg === "--yes") options.yes = true;
       else if (options.command === "fleet" && arg === "--keep-data") options.keepData = true;
@@ -1040,6 +1042,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         cap: options.cap,
         licenseKey: options.licenseKey ?? process.env.OMB_LICENSE_KEY,
         memory: options.memory,
+        desktops: options.desktops,
         dryRun: options.dryRun ?? false,
         yes: options.yes ?? false,
         keepData: options.keepData ?? false,

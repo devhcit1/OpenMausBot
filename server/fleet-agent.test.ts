@@ -23,6 +23,7 @@ function machine(root: string, options: { failing?: string[]; beforeRun?: (argv:
       calls.push(argv.join(" "));
       await options.beforeRun?.(argv);
       if (argv[0] === "systemctl" && argv[1] === "is-active") return { code: 0, output: "active\n" };
+      if (argv[0] === "pgrep") return { code: 1, output: "" };
       return options.failing?.some((prefix) => argv.join(" ").startsWith(prefix)) ? { code: 1, output: "unit failed: secret-token\n" } : { code: 0, output: "" };
     },
     readText: (path) => files.get(path) ?? (path.endsWith("fleet.json") ? null : null),
@@ -36,6 +37,7 @@ function machine(root: string, options: { failing?: string[]; beforeRun?: (argv:
     mkdir: () => {},
     appendOnce: () => {},
     remove: (path) => { files.delete(path); },
+    uid: () => 991,
     health: async () => true,
   };
   return { deps, files, calls, root };
