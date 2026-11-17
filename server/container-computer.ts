@@ -33,6 +33,7 @@ import {
   type HostUser,
 } from "./container-isolation.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { adoptUserSession } from "./user-session-env.ts";
 
 // Its own group: a timeout also ends the docker CLI plugins and credential helpers it started.
 const run = execFileInGroupAsync;
@@ -88,11 +89,17 @@ export interface LocalVmTarget {
   label: string;
 }
 
+/** `OMB_VM_VIEWER_PORT`: the shared desktop's loopback viewer port, so servers sharing one machine do not collide. */
+export function sharedViewerPort(env: Record<string, string | undefined> = process.env): number {
+  const port = Number(env.OMB_VM_VIEWER_PORT);
+  return Number.isInteger(port) && port > 0 && port < 65_536 ? port : HOST_VIEWER_PORT;
+}
+
 export const SHARED_LOCAL_VM_TARGET: LocalVmTarget = {
   key: "shared",
   containerName: CONTAINER,
   workspaceDir: VM_WORKSPACE_DIR,
-  viewerPort: HOST_VIEWER_PORT,
+  viewerPort: sharedViewerPort(),
   label: "shared",
 };
 
@@ -253,6 +260,7 @@ export async function containerRuntimeStatus(
   runner: CommandRunner = sh,
   platform: NodeJS.Platform = process.platform,
 ): Promise<ContainerRuntimeStatus> {
+  adoptUserSession();
   // Podman is the supported Windows VM lane and owns the pinned image; Docker-first would pick an unrelated image store.
   const candidates: Runtime[] = platform === "win32"
     ? ["podman", "docker"]

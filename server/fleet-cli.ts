@@ -1,6 +1,6 @@
 // Runs fleet.ts plans as root with fixed argument lists, or prints them for a root shell; never a shell command from user input.
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rmdirSync, rmSync } from "node:fs";
 import { posix } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { unstableInstallWarning } from "./service-unit.ts";
@@ -11,6 +11,10 @@ import {
   assertUnixUser,
   caddySite,
   createPlan,
+  DESKTOPS_DROP_IN,
+  desktopsDropInPath,
+  userManagerDropIn,
+  userManagerDropInPath,
   deletePlan,
   describeSteps,
   fleetLayout,
@@ -56,6 +60,8 @@ export interface FleetInput {
   cap?: number;
   licenseKey?: string;
   memory?: string;
+  /** `create --desktops`: its bots get Private desktops through rootless Podman. */
+  desktops?: boolean;
   dryRun: boolean;
   yes: boolean;
   keepData: boolean;
@@ -85,6 +91,7 @@ export interface FleetDeps {
   appendOnce(path: string, line: string): void;
   remove(path: string): void;
   health(url: string, timeoutMs: number): Promise<boolean>;
+  uid(user: string): number;
 }
 
 // Tenant-controlled ancestors can be renamed between any two filesystem calls: the boundary is dropping ALL root authority
@@ -235,7 +242,21 @@ export function defaultFleetDeps(): FleetDeps {
       const current = existsSync(path) ? readFileSync(path, "utf8") : "";
       if (!current.split("\n").some((existing) => existing.trim() === line)) appendFileSync(path, `${current.endsWith("\n") || !current ? "" : "\n"}\n${line}\n`);
     },
-    remove: (path) => rmSync(path, { force: true }),
+    remove: (path) => {
+      try {
+        if (lstatSync(path).isDirectory()) { rmdirSync(path); return; }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      rmSync(path, { force: true });
+    },
+    uid: (user) => {
+      assertUnixUser(user);
+      const uid = Number(execFileSync("/usr/bin/getent", ["passwd", user], { encoding: "utf8", timeout: 5_000 }).split(":")[2]);
+      if (!Number.isSafeInteger(uid) || uid <= 0) throw new Error(`no usable UID for ${user}`);
+      return uid;
+    },
     health: async (url, timeoutMs) => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -252,6 +273,17 @@ export function defaultFleetDeps(): FleetDeps {
 }
 
 const HEALTH_TIMEOUT_MS = 60_000;
+const QUIESCE_TIMEOUT_MS = 30_000;
+
+/** pgrep(1) exits 1 when no process matches. */
+async function quiesced(user: string, deps: FleetDeps, timeoutMs = QUIESCE_TIMEOUT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if ((await deps.run(["pgrep", "-u", user])).code === 1) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
 
 /** Stops at the first failed step, showing only the tool's last lines, never a secret from the plan. */
 export async function executePlan(steps: FleetStep[], deps: FleetDeps, io: FleetIo): Promise<number> {
@@ -271,9 +303,15 @@ export async function executePlan(steps: FleetStep[], deps: FleetDeps, io: Fleet
         break;
       case "run": {
         const result = await deps.run(step.argv);
-        if (result.code !== 0) return failed(io, `${step.why} (${step.argv[0]} exited ${result.code ?? "without a code"})`, result.output);
+        if (result.code !== 0 && !step.tolerate) return failed(io, `${step.why} (${step.argv[0]} exited ${result.code ?? "without a code"})`, result.output);
         break;
       }
+      case "after-user-manager":
+        deps.writeText(step.path, userManagerDropIn(deps.uid(step.user)), 0o644);
+        break;
+      case "quiesce":
+        if (!(await quiesced(step.user, deps))) return failed(io, step.why, `${step.user} still runs processes after ${QUIESCE_TIMEOUT_MS / 1000}s (pgrep -u ${step.user})`);
+        break;
       case "health":
         if (!(await deps.health(step.url, HEALTH_TIMEOUT_MS))) return failed(io, step.why, `${step.url} did not answer within ${HEALTH_TIMEOUT_MS / 1000}s; check journalctl -u openmausbot@<slug>`);
         break;
@@ -318,14 +356,18 @@ export function planFleetAction(input: FleetInput, deps: FleetDeps): FleetStep[]
       if (kept) {
         // Reinitializing templates must not erase reservations or open sibling ports.
         const registry = { ...kept, ...plan.registry, workspaces: kept.workspaces, nextPort: kept.nextPort };
-        const sites: FleetStep[] = Object.values(registry.workspaces)
-          .filter((workspace) => workspace.status === "running" || workspace.status === "suspended")
-          .map((workspace) => ({ kind: "write", path: posix.join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 }));
+        const live = Object.values(registry.workspaces).filter((workspace) => workspace.status === "running" || workspace.status === "suspended");
+        const sites: FleetStep[] = live.map((workspace) => ({ kind: "write", path: posix.join(layout.caddyDir, `${workspace.slug}.caddy`), content: caddySite(workspace, registry.edge), mode: 0o644 }));
+        const desktopUnits: FleetStep[] = live.filter((workspace) => workspace.desktops).flatMap((workspace): FleetStep[] => [
+          { kind: "write", path: desktopsDropInPath(layout, workspace.slug), content: DESKTOPS_DROP_IN, mode: 0o644 },
+          { kind: "after-user-manager", user: fleetUser(workspace.slug), path: userManagerDropInPath(layout, workspace.slug) },
+        ]);
         return plan.steps.flatMap((step): FleetStep[] => {
           if (step.kind === "write" && step.path === layout.registryFile) return [{ ...step, content: `${JSON.stringify(registry, null, 2)}\n` }];
           if (step.kind === "write" && step.path === layout.fenceFile) return [{ ...step, content: registryFence(registry) }];
           if (step.kind === "run" && step.argv.join(" ") === "systemctl enable --now openmausbot-fence.service") return [step, { kind: "run", argv: ["nft", "-f", layout.fenceFile], why: "reapply the preserved workspace fence" }];
           if (step.kind === "run" && step.argv.join(" ") === "systemctl reload caddy") return [...sites, step];
+          if (step.kind === "run" && step.argv.join(" ") === "systemctl daemon-reload") return [...desktopUnits, step];
           return [step];
         });
       }
@@ -350,6 +392,7 @@ export function planFleetAction(input: FleetInput, deps: FleetDeps): FleetStep[]
         seed: { admins: input.admins, members: input.members, ...(anthropicKey ? { anthropicKey } : {}), ...(input.anthropicUrl ? { anthropicUrl: input.anthropicUrl } : {}), ...(input.portalUrl ? { portalUrl: input.portalUrl } : {}), ...(input.cap !== undefined ? { monthlyCapUsd: input.cap } : {}), ...(brandJson ? { brandJson } : {}), openrouterKey: input.openrouterKey, openrouterUrl: input.openrouterUrl, openrouterModels: input.openrouterModels, openrouterDefault: input.openrouterDefault },
         ...(input.licenseKey ? { licenseKey: input.licenseKey } : {}),
         ...(input.memory ? { memoryMax: input.memory } : {}),
+        ...(input.desktops ? { desktops: true } : {}),
         layout,
       }).steps;
     }

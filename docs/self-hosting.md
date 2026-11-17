@@ -882,6 +882,40 @@ Point `*.<domain>` at the proxy, give the proxy the wildcard certificate,
 and send that whole domain to `SERVER:8800`. A later `init --yes` keeps both
 settings, and rewrites every site when you change them.
 
+The fence also keeps everything a workspace's user runs off private, shared,
+link-local and unique-local addresses. That covers its server and its
+desktops' rootless network, but not DNS. So a workspace reaches neither the
+LAN nor this server's LAN addresses. A provider on your LAN, such as a local
+model server, is out of a workspace's reach for the same reason.
+
+**Desktops:** `fleet create NAME --desktops` gives the workspace's bots
+Private desktops, run by its own user through rootless Podman:
+- `useradd --add-subids-for-system` gives the user its subordinate ID ranges;
+- `loginctl enable-linger` keeps its systemd user manager, which holds the
+  containers, up at boot;
+- a drop-in, `openmausbot@NAME.service.d/desktops.conf`, lifts the three
+  hardening settings rootless Podman cannot run under:
+  - `NoNewPrivileges`, because `newuidmap` is setuid;
+  - `ProtectHome`, because it hides `/run/user`;
+  - `ProtectSystem=strict`, because it makes `/run/user` read-only. It
+    becomes `full`, which keeps `/usr`, `/boot` and `/etc` read-only.
+
+  The drop-in doesn't bind `/run/user` writable. A bind would freeze it at
+  service start and hide the runtime folder systemd mounts later. Bots keep
+  no-new-privileges anyway, because bubblewrap sets it in every box.
+  `fleet init --yes` rewrites the drop-in for every workspace with desktops.
+- a second drop-in, `user-manager.conf`, makes the workspace require
+  `user@<uid>.service` and start after it. systemd mounts the user's runtime
+  folder with private propagation, so a service that started first would
+  never see it.
+
+The server finds `/run/user/<uid>` and its bus by itself, so the unit names
+neither. The shared desktop's viewer listens on the workspace's third port
+(`OMB_VM_VIEWER_PORT`, inside the fence). Each workspace keeps its own copy of
+the desktop image. Desktops run under the user manager, outside the service,
+so `--memory` does not cap them. `suspend` and `delete` end the user manager
+and every desktop with it.
+
 `fleet upgrade` runs `npm install -g openmausbot@latest` only when the fleet
 runs from an npm install. On a server built from a checkout, it restarts the
 workspaces on what is there now.

@@ -152,7 +152,7 @@ export function createFleetAgent(options: FleetAgentOptions): Server {
         const body = await readBody(req);
         const result = await act({
           ...base(), action: "create", slug: text(body.slug), admins: strings(body.admins), members: strings(body.members),
-          cap: number(body.cap), memory: text(body.memory), brandJson: text(body.brandJson), anthropicKey: text(body.anthropicKey),
+          cap: number(body.cap), memory: text(body.memory), desktops: body.desktops === true, brandJson: text(body.brandJson), anthropicKey: text(body.anthropicKey),
           portalUrl: text(body.portalUrl), anthropicUrl: text(body.anthropicUrl),
           openrouterKey: text(body.openrouterKey), openrouterUrl: text(body.openrouterUrl),
           openrouterModels: body.openrouterModels === undefined ? undefined : models(body.openrouterModels), openrouterDefault: body.openrouterDefault === true,
