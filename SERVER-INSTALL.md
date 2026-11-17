@@ -388,10 +388,14 @@ Adds separate workspaces for customers on a **C** server, each at
 A workspace's ports are open only to its own user. Your own workspace
 (`maus`, port 8080) is closed to every customer workspace too.
 
-> **Not for real customers yet.** Customer workspaces don't run the bot
-> sandbox yet, so a customer's bots can reach your LAN. They still can't
-> reach other workspaces' files or ports. Use test workspaces until the
-> sandbox comes to them.
+Every bot turn in a customer workspace runs in the bot sandbox, as in A:
+- its network reaches only public internet addresses, so not your LAN,
+  pfSense or this server;
+- it can't read the workspace's keys or settings.
+
+A workspace whose sandbox can't start doesn't start at all. Check one with
+`journalctl -u openmausbot@NAME | grep "bot box"`. Expect `bot box: on` and
+a passing self-check.
 
 Placeholder: `FLEET_DOMAIN` is the domain whose subdomains the workspaces
 use, for example `ai.hcitprofessionals.us`.
