@@ -189,6 +189,8 @@ export function templateUnit(spec: { node: string; script: string; layout?: Flee
     `EnvironmentFile=${layout.instancesDir}/%i.env`,
     `Environment=HOME=${layout.homesDir}/%i`,
     "Environment=PATH=/usr/local/bin:/usr/bin:/bin",
+    "# Every bot turn runs in the bot box; a workspace that cannot make one does not start.",
+    "Environment=OMB_BOT_BOX=required",
     `ExecStart=${spec.node}${strip} ${spec.script} serve --port \${OMB_PORT} --data-dir \${OMB_DATA_DIR} --public-url \${OMB_PUBLIC_URL} --label %i --no-pair`,
     "Restart=always",
     "RestartSec=3",

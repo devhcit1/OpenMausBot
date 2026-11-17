@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { CONTROL_PLANE_ENV, WORKSPACE_CREDENTIAL_ENV } from "../config.ts";
 import { BOX_BRIDGE_SCRIPT, botBox, type BotBox } from "./box.ts";
+import { boxRequired } from "./detect.ts";
 import { serverPath } from "./program-trust.ts";
 import { runBoxSelfCheck } from "./self-check.ts";
 
@@ -24,11 +25,17 @@ export async function startBotBoxAtBoot(options: {
   box?: BotBox;
   /** Off in tests that only want the gates. */
   selfCheck?: boolean;
+  env?: Record<string, string | undefined>;
   delayMs?: number;
 }): Promise<void> {
   const box = options.box ?? botBox;
   const log = options.log ?? ((line: string) => console.log(line));
-  const detection = await box.start({ dataDir: options.dataDir, home: options.home ?? homedir(), port: options.port, denyEnv: BOX_DENY_ENV, log });
+  const env = options.env ?? process.env;
+  const detection = await box.start({ dataDir: options.dataDir, home: options.home ?? homedir(), port: options.port, denyEnv: BOX_DENY_ENV, log, env });
+  // Security: a workspace that requires the box never serves a turn outside it.
+  if (boxRequired(env) && (detection.box !== "bwrap" || !detection.tools)) {
+    throw new Error(`bot box: required (OMB_BOT_BOX=required) but off (${detection.reason}); not starting`);
+  }
   // What the server starts with no PATH of its own (a plain spawn) finds nothing in HOME either.
   if (box === botBox && box.enabled()) process.env.PATH = serverPath(process.env.PATH);
   if (detection.box !== "bwrap" || !detection.tools || options.selfCheck === false) return;

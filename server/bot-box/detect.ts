@@ -29,12 +29,16 @@ export function cloudRole(env: Record<string, string | undefined>): boolean {
   return env.OMB_CLOUD_ROLE === "home" || env.OMB_CLOUD_ROLE === "team";
 }
 
-/** `OMB_BOT_BOX`: unset (Cloud homes on, others off), 0/off, 1/on/bwrap. */
+/** `OMB_BOT_BOX`: unset (Cloud homes on, others off), 0/off, 1/on/bwrap, or required (on, and the server will not start without it). */
 export function boxWanted(env: Record<string, string | undefined>): "on" | "off" | "default" {
   const raw = (env.OMB_BOT_BOX ?? "").trim().toLowerCase();
   if (raw === "0" || raw === "off" || raw === "false" || raw === "no") return "off";
-  if (raw === "1" || raw === "on" || raw === "bwrap" || raw === "true" || raw === "yes") return "on";
+  if (raw === "1" || raw === "on" || raw === "bwrap" || raw === "true" || raw === "yes" || raw === "required") return "on";
   return "default";
+}
+
+export function boxRequired(env: Record<string, string | undefined>): boolean {
+  return (env.OMB_BOT_BOX ?? "").trim().toLowerCase() === "required";
 }
 
 export function whichOnPath(name: string, env: Record<string, string | undefined> = process.env): string | null {

@@ -52,7 +52,7 @@ describe("rendered files", () => {
     expect(unit).toContain("User=omb-%i");
     expect(unit).toContain("EnvironmentFile=/etc/openmausbot/instances/%i.env");
     expect(unit).toContain("ExecStart=/usr/bin/node /usr/lib/node_modules/openmausbot/cli.js serve --port ${OMB_PORT} --data-dir ${OMB_DATA_DIR} --public-url ${OMB_PUBLIC_URL} --label %i --no-pair");
-    for (const line of ["PrivateTmp=yes", "NoNewPrivileges=yes", "ProtectSystem=strict", "ReadWritePaths=/var/lib/openmausbot/%i"]) expect(unit).toContain(line);
+    for (const line of ["PrivateTmp=yes", "NoNewPrivileges=yes", "ProtectSystem=strict", "ReadWritePaths=/var/lib/openmausbot/%i", "Environment=OMB_BOT_BOX=required"]) expect(unit).toContain(line);
     expect(templateUnit({ node: "/usr/bin/node", script: "/src/server/cli.ts", layout })).toContain("--experimental-strip-types /src/server/cli.ts");
   });
 

@@ -825,10 +825,18 @@ Providers added with `opencode auth login` work everywhere.
 each as its own OS user, its own `openmausbot@<name>` service on its own
 loopback ports, its own data folder, brand, sign-in list and provider key,
 reached at `<name>.<your domain>` through the system Caddy. Bots of one
-workspace cannot read another's files or reach its API: the data lives in a
-private home, the unit runs with a private `/tmp`, no new privileges and a
-read-only system, and an nftables rule keeps each workspace's ports to its
-own user, Caddy and root.
+workspace cannot read another's files or reach its API:
+- the data lives in a private home;
+- the unit runs with a private `/tmp`, no new privileges and a read-only
+  system;
+- an nftables rule keeps each workspace's ports to its own user, Caddy and
+  root.
+
+The unit also sets `OMB_BOT_BOX=required`, so every bot turn runs in the
+bot box (docs/bot-box.md). The box gives it no local network and keeps the
+workspace's own keys and settings out of its reach. A workspace whose
+machine can't make a box doesn't start. Its `fleet create` then stops at
+the health wait.
 
 Once, as root, with the package installed permanently and a wildcard DNS
 record (`*.example.com`) pointing at the server:

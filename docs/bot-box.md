@@ -53,7 +53,8 @@ connects to a path inside the box.
 `server/bot-box/detect.ts`: on by default on a Cloud home (`OMB_CLOUD_ROLE=home` or `team`), off everywhere else
 unless `OMB_BOT_BOX=1`; `OMB_BOT_BOX=0` turns it off. It is never on without a working unprivileged bubblewrap: if the
 kernel refuses user namespaces or the image has no `bwrap`, the box reports `off` with the reason, and the Admin shows
-it. The cloud-home image installs `bubblewrap` and `socat` (the in-box bridges; without socat a bundled Node bridge does
+it. `OMB_BOT_BOX=required` is `1` that fails closed: the server stops at boot rather than run turns outside the box.
+Every `openmausbot fleet` workspace gets it from the template unit. The cloud-home image installs `bubblewrap` and `socat` (the in-box bridges; without socat a bundled Node bridge does
 the same).
 
 Cost on Fly (measured, T0 build notes): about 5 ms and 3 MB per box, plus one socat per bridge.
