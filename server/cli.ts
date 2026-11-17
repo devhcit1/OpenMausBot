@@ -34,7 +34,7 @@ import { runServiceCommand } from "./service-cli.ts";
 import { runSentinelCli } from "./sentinel/cli.ts";
 import { runFleetCommand, type FleetInput } from "./fleet-cli.ts";
 import { startFleetAgent } from "./fleet-agent.ts";
-import { fleetLayout } from "./fleet.ts";
+import { FLEET_EDGE_PORT, fleetLayout } from "./fleet.ts";
 import { clearLeftoverTailscaleServe, explainTailscaleFailure, tailnetListenFallback, tailscaleServe, tailscaleStatus, type TailscaleStatus } from "./tailscale.ts";
 import { defaultSetupIo, SetupCancelled, type SetupIo } from "./cli-prompts.ts";
 import { HEADLESS_VERB_NAMES, usage } from "./cli-usage.ts";
@@ -96,6 +96,9 @@ export interface CliOptions {
   /** `fleet init|create|list|users|suspend|resume|delete|upgrade|agent` */
   fleetAction?: FleetInput["action"] | "agent";
   operator?: string;
+  operatorPort?: number;
+  behindProxy?: string;
+  edgePort?: number;
   socket?: string;
   group?: string;
   slug?: string;
@@ -189,6 +192,9 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
       else if (options.command === "fleet" && !options.fleetAction && ["init", "create", "list", "users", "suspend", "resume", "delete", "upgrade", "agent"].includes(arg)) options.fleetAction = arg as FleetInput["action"] | "agent";
       else if (options.command === "fleet" && options.fleetAction && !["init", "list", "upgrade", "agent"].includes(options.fleetAction) && !options.slug && !arg.startsWith("--")) options.slug = arg;
       else if (options.command === "fleet" && arg === "--operator") options.operator = value();
+      else if (options.command === "fleet" && arg === "--operator-port") options.operatorPort = Number(value());
+      else if (options.command === "fleet" && arg === "--behind-proxy") options.behindProxy = value();
+      else if (options.command === "fleet" && arg === "--edge-port") options.edgePort = Number(value());
       else if (options.command === "fleet" && arg === "--socket") options.socket = value();
       else if (options.command === "fleet" && arg === "--group") options.group = value();
       else if (options.command === "fleet" && options.fleetAction === "users" && options.slug && !options.fleetUserAction && (arg === "add" || arg === "remove")) { options.fleetUserAction = arg; options.email = value(); }
@@ -221,6 +227,8 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
     if (!options.fleetAction) return { error: "fleet needs one of: init --domain HOST [--operator USER], create NAME --admin EMAIL, list, users NAME add|remove EMAIL, suspend NAME, resume NAME, delete NAME --yes, upgrade, agent" };
     if (["create", "users", "suspend", "resume", "delete"].includes(options.fleetAction) && !options.slug) return { error: `fleet ${options.fleetAction} needs a workspace name` };
     if (options.fleetAction === "users" && !options.fleetUserAction) return { error: "fleet users needs: NAME add|remove EMAIL [--chat-only]" };
+    if ((options.behindProxy || options.edgePort !== undefined || options.operatorPort !== undefined) && options.fleetAction !== "init") return { error: "--behind-proxy, --edge-port and --operator-port belong to fleet init" };
+    if (options.edgePort !== undefined && !options.behindProxy) return { error: "--edge-port needs --behind-proxy, the address of the proxy that ends TLS" };
     if (options.cap !== undefined && (!Number.isFinite(options.cap) || options.cap < 0)) return { error: "--cap must be a dollar amount of 0 or more" };
   }
   return options;
@@ -1023,6 +1031,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         slug: options.slug,
         domain: options.domain,
         operator: options.operator ?? process.env.SUDO_USER,
+        ...(options.behindProxy ? { edge: { proxy: options.behindProxy, port: options.edgePort ?? FLEET_EDGE_PORT } } : {}),
+        ...(options.operatorPort !== undefined ? { operatorPort: options.operatorPort } : {}),
         admins: options.admins ?? [],
         members: options.members ?? [],
         brandFile: options.brandFile,

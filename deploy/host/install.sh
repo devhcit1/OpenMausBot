@@ -4,6 +4,9 @@
 #
 #   sudo bash deploy/host/install.sh --public-url https://maus.example.com --proxy-ip 192.168.10.1 [--import-docker]
 #
+# With --fleet-domain it also hosts customer workspaces (`openmausbot fleet`) behind the same proxy, each at
+# NAME.<domain>, through a local Caddy on one plain-HTTP port.
+#
 # Run it again to update: it rebuilds from the branch and restarts the service. SERVER-INSTALL.md, part C, explains it.
 set -euo pipefail
 
@@ -23,6 +26,8 @@ PUBLIC_URL=""
 PROXY_IP=""
 IMPORT_DOCKER=0
 BROWSER=1
+FLEET_DOMAIN=""
+FLEET_PORT=8800
 
 say() { printf '\n== %s\n' "$*"; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
@@ -39,6 +44,8 @@ usage: sudo bash deploy/host/install.sh --public-url https://HOST --proxy-ip IP 
   --branch NAME        the branch to build (default $BRANCH)
   --repo URL           the repository to build (default $REPO)
   --no-browser         skip the bots' browser (Chrome for Testing)
+  --fleet-domain D     also host customer workspaces at NAME.D (HAProxy sends *.D to --fleet-port)
+  --fleet-port N       the plain-HTTP port for every customer workspace (default $FLEET_PORT)
 EOF
 }
 
@@ -52,6 +59,8 @@ while [ $# -gt 0 ]; do
     --branch) BRANCH="${2:?}"; shift 2 ;;
     --repo) REPO="${2:?}"; shift 2 ;;
     --no-browser) BROWSER=0; shift ;;
+    --fleet-domain) FLEET_DOMAIN="${2:?}"; shift 2 ;;
+    --fleet-port) FLEET_PORT="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
@@ -61,6 +70,8 @@ done
 if [ -z "$PUBLIC_URL" ] || [ -z "$PROXY_IP" ]; then usage >&2; exit 2; fi
 case "$PUBLIC_URL" in https://*) ;; *) die "--public-url must start with https://" ;; esac
 case "$PORT" in ''|*[!0-9]*) die "--port must be a number" ;; esac
+case "$FLEET_PORT" in ''|*[!0-9]*) die "--fleet-port must be a number" ;; esac
+if [ "$FLEET_PORT" = "$PORT" ] || [ "$FLEET_PORT" = "$((PORT + 1))" ]; then die "--fleet-port must differ from --port and the webhook port after it"; fi
 if ! command -v systemctl >/dev/null || [ ! -d /run/systemd/system ]; then die "this server does not run systemd"; fi
 command -v apt-get >/dev/null || die "this script is for Ubuntu or Debian (apt)"
 
@@ -76,6 +87,7 @@ say "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends ca-certificates curl git bubblewrap socat python3 podman uidmap passt slirp4netns >/dev/null
+if [ -n "$FLEET_DOMAIN" ]; then apt-get install -y -qq --no-install-recommends caddy nftables >/dev/null; fi
 node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
 if [ "$node_major" -lt 24 ]; then
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash - >/dev/null
@@ -209,16 +221,20 @@ systemctl enable --now openmausbot >/dev/null 2>&1
 
 say "firewall"
 webhook_port=$((PORT + 1))
+proxied_ports="$PORT $webhook_port"
+if [ -n "$FLEET_DOMAIN" ]; then proxied_ports="$proxied_ports $FLEET_PORT"; fi
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-  for p in "$PORT" "$webhook_port"; do
+  for p in $proxied_ports; do
     ufw allow from "$PROXY_IP" to any port "$p" proto tcp >/dev/null
     ufw deny "$p/tcp" >/dev/null
   done
-  echo "ufw: only $PROXY_IP reaches ports $PORT and $webhook_port"
+  echo "ufw: only $PROXY_IP reaches ports $proxied_ports"
 else
   # Security: the server believes X-Forwarded-Proto from whoever reaches the port, so only HAProxy may.
-  echo "WARNING: ufw is not active. Allow only $PROXY_IP to reach tcp ports $PORT and $webhook_port, for example:"
-  echo "  ufw allow OpenSSH && ufw allow from $PROXY_IP to any port $PORT proto tcp && ufw allow from $PROXY_IP to any port $webhook_port proto tcp && ufw enable"
+  echo "WARNING: ufw is not active. Allow only $PROXY_IP to reach tcp ports $proxied_ports, for example:"
+  printf '  ufw allow OpenSSH'
+  for p in $proxied_ports; do printf ' && ufw allow from %s to any port %s proto tcp' "$PROXY_IP" "$p"; done
+  printf ' && ufw enable\n'
 fi
 
 say "start"
@@ -228,6 +244,15 @@ echo "health: ok on port $PORT"
 for _ in $(seq 1 30); do journalctl -u openmausbot --since "-5min" --no-pager | grep -q "bot box: self-check" && break; sleep 2; done
 journalctl -u openmausbot --since "-5min" --no-pager | grep -o "bot box: .*" | tail -2
 
+if [ -n "$FLEET_DOMAIN" ]; then
+  say "customer workspaces at *.$FLEET_DOMAIN"
+  systemctl enable --now caddy >/dev/null 2>&1
+  node "$CODE/dist-server/openmausbot.js" fleet init --domain "$FLEET_DOMAIN" --operator "$SERVICE_USER" --operator-port "$PORT" \
+    --behind-proxy "$PROXY_IP" --edge-port "$FLEET_PORT" --yes
+  node "$CODE/dist-server/openmausbot.js" fleet upgrade
+  node "$CODE/dist-server/openmausbot.js" fleet list
+fi
+
 cat <<EOF
 
 Done. HAProxy's backend stays at this server's address, port $PORT.
@@ -236,8 +261,17 @@ Done. HAProxy's backend stays at this server's address, port $PORT.
   logs:      journalctl -u openmausbot -f
   pair:      sudo -iu $SERVICE_USER openmausbot pair --label "My phone"
   engines:   sudo -iu $SERVICE_USER codex login --device-auth
-  update:    sudo bash $CODE/deploy/host/install.sh --public-url $PUBLIC_URL --proxy-ip $PROXY_IP
+  update:    sudo bash $CODE/deploy/host/install.sh --public-url $PUBLIC_URL --proxy-ip $PROXY_IP${FLEET_DOMAIN:+ --fleet-domain $FLEET_DOMAIN --fleet-port $FLEET_PORT}
 EOF
+if [ -n "$FLEET_DOMAIN" ]; then
+  cat <<EOF
+
+  Customer workspaces: HAProxy sends *.$FLEET_DOMAIN to this server's port $FLEET_PORT (plain HTTP).
+  new one:   sudo openmausbot fleet create NAME --admin owner@customer.example [--memory 2G] [--cap 50]
+  list:      sudo openmausbot fleet list
+  logs:      journalctl -u openmausbot@NAME -f
+EOF
+fi
 if [ -n "${docker_containers:-}" ]; then
   cat <<EOF
   go back:   sudo systemctl disable --now openmausbot

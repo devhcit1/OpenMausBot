@@ -344,9 +344,11 @@ It ends by printing the sandbox's status and self-check. Expect
 
 ### C3. Use a desktop
 
-In the app, open the bot's **Screen** panel and set **Works on** to **Local VM**. The first
-start downloads the desktop image (a few GB), so allow a few minutes. Each
-conversation reaches only its own desktop connection.
+Once, in **Settings → Bot desktops**, click **Prepare Cua desktop** (step 3).
+It downloads and builds the desktop image, a few GB, in 5 to 15 minutes. Then
+open the bot's **Screen** panel and set **Works on** to **Private desktop**. The
+bot's next conversation creates and starts its desktop. Each conversation
+reaches only its own desktop connection.
 
 The desktop is the bot's own computer, with normal network access: it runs
 commands there with its `exec` tool, `ssh` included. The bot's own shell stays
@@ -373,6 +375,85 @@ Docker volume is untouched until you delete it.
 
 ---
 
+## D. Customer workspaces (fleet)
+
+Adds separate workspaces for customers on a **C** server, each at
+`https://NAME.FLEET_DOMAIN`. Every workspace has:
+
+- its own Unix user, `omb-NAME`;
+- its own data folder, `/var/lib/openmausbot/NAME`;
+- its own service, `openmausbot@NAME`;
+- its own sign-in list, keys and spending cap.
+
+A workspace's ports are open only to its own user. Your own workspace
+(`maus`, port 8080) is closed to every customer workspace too.
+
+> **Not for real customers yet.** Customer workspaces don't run the bot
+> sandbox yet, so a customer's bots can reach your LAN. They still can't
+> reach other workspaces' files or ports. Use test workspaces until the
+> sandbox comes to them.
+
+Placeholder: `FLEET_DOMAIN` is the domain whose subdomains the workspaces
+use, for example `ai.hcitprofessionals.us`.
+
+### D1. DNS and certificate
+
+- Add a wildcard DNS record, `*.FLEET_DOMAIN`, pointing at pfSense's WAN address.
+- Get a wildcard certificate for `*.FLEET_DOMAIN` on pfSense. The ACME package
+  can issue one with a DNS-01 challenge.
+
+### D2. Turn it on
+
+Run C2's script again with the fleet options:
+
+```sh
+sudo bash /opt/openmausbot/deploy/host/install.sh \
+  --public-url https://maus02.hcitprofessionals.us --proxy-ip PFSENSE_IP \
+  --fleet-domain FLEET_DOMAIN
+```
+
+The script installs Caddy and nftables and sets up the fleet. Caddy serves
+every workspace as plain HTTP on port **8800**, holds no certificates, and
+drops every connection that doesn't come from `PFSENSE_IP`. `ufw` allows
+port 8800 from `PFSENSE_IP` only. Re-running the script later updates every
+workspace and restarts it.
+
+### D3. HAProxy on pfSense
+
+- **Backend** `fleet`: `SERVER_LAN_IP:8800`, with the same settings as A8
+  (HTTP mode, `Host` unchanged, forwardfor, long timeouts, no buffering).
+- **Frontend:** in your HTTPS frontend, add the wildcard certificate and an
+  ACL: Host header ends with `.FLEET_DOMAIN`, use backend `fleet`.
+
+Adding a customer needs no pfSense change.
+
+### D4. Add a customer
+
+```sh
+sudo openmausbot fleet create acme --admin owner@acme.example --memory 2G --cap 50
+```
+
+- `--member @acme.example` lets everyone at that domain sign in for chat only.
+- `--anthropic-key-file FILE` gives the workspace a Claude API key. Otherwise
+  its admin adds a key in Settings.
+- `--memory` caps the workspace's RAM; `--cap` caps its monthly spending in
+  dollars.
+
+The admin opens `https://acme.FLEET_DOMAIN` and signs in with a code sent
+to their email.
+
+### D5. Day to day
+
+```sh
+sudo openmausbot fleet list
+sudo openmausbot fleet users acme add bob@acme.example [--chat-only]
+sudo openmausbot fleet suspend acme      # its address shows "suspended"; resume undoes it
+sudo openmausbot fleet delete acme --yes # add --keep-data to keep its folder
+journalctl -u openmausbot@acme -f
+```
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -387,5 +468,7 @@ Docker volume is untouched until you delete it.
 
 | C: `bubblewrap cannot make a sandbox as maus` | AppArmor refuses user namespaces: `sudo apt-get install --reinstall apparmor bubblewrap`, then `sudo systemctl reload apparmor` |
 | C: Local VM won't start | Run `sudo -iu maus podman info`. A `/run/user/...` error means lingering is off: `sudo loginctl enable-linger maus` |
+| D: a workspace address resets the connection | The request did not come from `PFSENSE_IP` (D2), or HAProxy's `fleet` backend points at the wrong port |
+| D: "This workspace is not available." | `fleet create` stopped partway: `sudo openmausbot fleet list`, then `journalctl -u openmausbot@NAME` |
 
 Logs: `sudo docker compose logs omb` (A) or `journalctl -u openmausbot` (B, C).
