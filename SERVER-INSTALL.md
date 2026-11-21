@@ -9,7 +9,7 @@ Three ways to run it:
 |---|---|---|---|
 | Bot sandbox | **Yes**: bots can't read the server's keys, settings or each other's files | No: bots run as the service user and can read everything it can | **Yes**, as in A |
 | Bot desktops (Local VM) | No | Yes, but unsandboxed | **Yes**, through rootless Podman |
-| Version | The `self-hosted-bot-box` branch, built on the server | The published npm release | The `self-hosted-bot-box` branch, built on the server |
+| Version | The `fleet-behind-proxy` branch, built on the server | The published npm release | The `fleet-behind-proxy` branch, built on the server |
 | Engines (Claude Code, Codex, Grok) | Baked into the image | Installed by you on the host | Installed by the script |
 | Updates | `git pull` + rebuild | `npm install` of the new version | Re-run the script |
 
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/milind-soni/OpenMausBot/main/deploy
 ### A2. Get the code and build the server image
 
 ```sh
-sudo git clone -b self-hosted-bot-box https://github.com/devhcit1/OpenMausBot.git /opt/openmausbot-src
+sudo git clone -b fleet-behind-proxy https://github.com/devhcit1/OpenMausBot.git /opt/openmausbot-src
 cd /opt/openmausbot-src
 sudo docker build -t openmausbot-server:box .
 ```
@@ -318,7 +318,7 @@ desktop. One script installs it, or moves an **A** install over, data included.
 ### C2. Install, or move from Docker
 
 ```sh
-sudo git clone -b self-hosted-bot-box https://github.com/devhcit1/OpenMausBot.git /opt/openmausbot
+sudo git clone -b fleet-behind-proxy https://github.com/devhcit1/OpenMausBot.git /opt/openmausbot
 sudo bash /opt/openmausbot/deploy/host/install.sh \
   --public-url https://maus02.hcitprofessionals.us --proxy-ip PFSENSE_IP --import-docker
 ```
@@ -487,7 +487,7 @@ journalctl -u openmausbot@acme -f
 | Page loads, sign-in fails or loops | `OMB_TRUSTED_PROXY_CIDRS` is not pfSense's address as seen by the server; or HAProxy rewrites `Host` |
 | Chat stops updating after a minute | HAProxy timeouts too short, or buffering the event stream |
 | `bot box: off (userns-refused)` | Host not prepared (A3), or the container started without `compose.box.yaml` (check `COMPOSE_FILE` in `.env`) |
-| `bot box: off (no-bwrap)` | The image was not built from the `self-hosted-bot-box` branch (A2) |
+| `bot box: off (no-bwrap)` | The image was not built from the `fleet-behind-proxy` branch (A2) |
 | Self-check fails only `keyring-denied` | The image predates python3 in the server image: update (A11) |
 
 | C: `bubblewrap cannot make a sandbox as maus` | AppArmor refuses user namespaces: `sudo apt-get install --reinstall apparmor bubblewrap`, then `sudo systemctl reload apparmor` |

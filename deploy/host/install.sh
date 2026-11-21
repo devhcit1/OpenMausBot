@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO=https://github.com/devhcit1/OpenMausBot.git
-BRANCH=self-hosted-bot-box
+BRANCH=fleet-behind-proxy
 CODE=/opt/openmausbot
 SERVICE_USER=maus
 # The Docker image's HOME: keeping it means the paths saved in the data, and the engines' sessions, which they key by
@@ -143,6 +143,9 @@ git -C "$CODE" log -1 --format='%h %s'
   NODE_OPTIONS=--max-old-space-size=6144 pnpm exec vite build >/dev/null
 )
 if [ ! -f "$CODE/dist-server/openmausbot.js" ] || [ ! -f "$CODE/dist/index.html" ]; then die "the build did not produce dist-server/ and dist/"; fi
+if [ -n "$FLEET_DOMAIN" ] && ! grep -q -- '--operator-port' "$CODE/dist-server/openmausbot.js"; then
+  die "branch $BRANCH has no customer workspaces behind a proxy: run again with --branch fleet-behind-proxy"
+fi
 # Security: the server runs this code as maus, and bots can write maus's home; nobody but root may change it.
 chown -R root:root "$CODE"
 chmod -R go-w "$CODE"
